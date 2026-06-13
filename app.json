@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Koora Test — كورة تيست",
+    "slug": "koora-test",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "backgroundColor": "#06281C",
+    "splash": {
+      "backgroundColor": "#06281C"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.kooratest.demo"
+    },
+    "assetBundlePatterns": [
+      "assets/**/*"
+    ]
+  }
+}
