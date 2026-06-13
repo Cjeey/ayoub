@@ -14,8 +14,14 @@ source, so a rights holder could later point it at a licensed stream.
 - 📅 **Match list grouped by date** — اليوم / غدا / Arabic date headers, pull-to-refresh
 - 📋 **Match detail screen** — teams, group, stadium, city, kickoff time
 - ▶️ **Video player** — `expo-av` playing a **local bundled demo video** (`assets/video/demo-match.mp4`)
-- 🔓 **"∗6 test mode"** — tap the `∗6` button on the Home screen **6 times** to unlock the demo
-  content. It only flips a local AsyncStorage flag; one tap turns it off again.
+- 🔓 **"∗6 test mode"** — two ways to unlock the demo content:
+  - tap the `∗6` button on the Home screen **6 times** (one tap turns it off again), or
+  - type the literal code **`*6`** in the admin settings code box.
+  Either way it only flips a local AsyncStorage flag.
+- ⚙️ **Admin settings** — a screen where you configure a **licensed stream provider**
+  (provider name, stream URL, access token, notes). This is where you paste whatever
+  beIN SPORTS gives you once you have a broadcast agreement. When a stream is configured,
+  the player uses it instead of the demo clip; until then the app stays demo-only.
 - 📦 **Offline support** — fixtures are seeded into AsyncStorage on first launch and read from
   there afterwards, so the app works with no network
 - 🇲🇦 **Arabic / Darija-friendly UI** — all strings in `src/i18n/strings.ts`, RTL-aware layout
@@ -58,6 +64,9 @@ npm run typecheck
 3. Go back Home and tap **∗6 وضع التجربة** six times → test mode unlocks (persisted locally).
 4. Open a match again → **▶️ شوف البث التجريبي** plays the bundled demo clip.
 5. Kill the network / enable airplane mode and relaunch → fixtures still load from AsyncStorage.
+6. Alternative unlock: Home → **⚙️ الإعدادات (الإدارة)** → type `*6` in the code box → apply.
+7. Licensed stream (later): in the same admin screen, fill in provider/URL/token from your
+   beIN SPORTS agreement and save — the player switches from the demo clip to that stream.
 
 ## Folder structure
 
@@ -82,13 +91,16 @@ npm run typecheck
     ├── navigation/
     │   └── types.ts             # Typed route params
     ├── screens/
+    │   ├── AdminSettingsScreen.tsx  # *6 code entry + licensed stream config
     │   ├── HomeScreen.tsx
     │   ├── MatchListScreen.tsx  # SectionList grouped by date
     │   ├── MatchDetailScreen.tsx
-    │   └── PlayerScreen.tsx     # expo-av player (demo asset only)
+    │   └── PlayerScreen.tsx     # expo-av player (demo clip or configured stream)
     ├── storage/
     │   ├── fixturesStore.ts     # Offline seed/load/refresh via AsyncStorage
-    │   └── useFixtures.ts       # React hook around the store
+    │   ├── streamConfigStore.ts # Licensed stream provider config (AsyncStorage)
+    │   ├── useFixtures.ts       # React hook around the fixtures store
+    │   └── useStreamConfig.ts   # Focus-aware hook around the stream config
     ├── theme/
     │   └── theme.ts             # Colors, spacing, radii, font sizes
     └── utils/

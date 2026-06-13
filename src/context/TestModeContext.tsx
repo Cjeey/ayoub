@@ -15,6 +15,8 @@ export const UNLOCK_TAPS = 6;
 /** Tap counter resets after this much inactivity (ms). */
 const TAP_WINDOW_MS = 3000;
 
+export type CodeResult = 'enabled' | 'disabled' | 'invalid';
+
 interface TestModeValue {
   /** True once the persisted flag has been read from storage */
   ready: boolean;
@@ -25,12 +27,18 @@ interface TestModeValue {
    * When already enabled, a single tap disables test mode again.
    */
   registerTap: () => number;
+  /**
+   * Apply a dial-style activation code. "*6" toggles test mode;
+   * anything else is rejected. Local flag only — nothing remote.
+   */
+  applyCode: (code: string) => CodeResult;
 }
 
 const TestModeContext = createContext<TestModeValue>({
   ready: false,
   enabled: false,
   registerTap: () => UNLOCK_TAPS,
+  applyCode: () => 'invalid',
 });
 
 export function TestModeProvider({ children }: { children: React.ReactNode }) {
@@ -74,8 +82,18 @@ export function TestModeProvider({ children }: { children: React.ReactNode }) {
     return remaining;
   }, [enabled, persist]);
 
+  const applyCode = useCallback(
+    (code: string): CodeResult => {
+      if (code.trim() !== '*6') return 'invalid';
+      const next = !enabled;
+      persist(next);
+      return next ? 'enabled' : 'disabled';
+    },
+    [enabled, persist],
+  );
+
   return (
-    <TestModeContext.Provider value={{ ready, enabled, registerTap }}>
+    <TestModeContext.Provider value={{ ready, enabled, registerTap, applyCode }}>
       {children}
     </TestModeContext.Provider>
   );

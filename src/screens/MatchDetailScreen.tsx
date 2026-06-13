@@ -13,12 +13,18 @@ import { useTestMode } from '../context/TestModeContext';
 import { t } from '../i18n/strings';
 import { RootScreenProps } from '../navigation/types';
 import { useFixtures } from '../storage/useFixtures';
+import { useStreamConfig } from '../storage/useStreamConfig';
 import { colors, font, radius, spacing } from '../theme/theme';
 import { dateLabel, kickoffTime, localDateKey } from '../utils/date';
 
 export function MatchDetailScreen({ navigation, route }: RootScreenProps<'MatchDetail'>) {
   const { matches, loading } = useFixtures();
   const { enabled: testMode } = useTestMode();
+  const { config: streamConfig } = useStreamConfig();
+
+  // Watchable when the local *6 test mode is on (demo clip) or when a
+  // licensed stream has been configured in admin settings.
+  const canWatch = testMode || !!streamConfig?.url;
 
   const match = matches.find((m) => m.id === route.params.matchId);
 
@@ -69,13 +75,15 @@ export function MatchDetailScreen({ navigation, route }: RootScreenProps<'MatchD
         />
       </View>
 
-      {testMode ? (
+      {canWatch ? (
         <Pressable
           style={({ pressed }) => [styles.watchButton, pressed && styles.pressed]}
           onPress={() => navigation.navigate('Player', { matchId: match.id })}
           accessibilityRole="button"
         >
-          <Text style={styles.watchButtonText}>{t.watchDemo}</Text>
+          <Text style={styles.watchButtonText}>
+            {streamConfig?.url ? t.licensedBanner(streamConfig.provider) : t.watchDemo}
+          </Text>
         </Pressable>
       ) : (
         <View style={styles.lockedCard}>

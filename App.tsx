@@ -7,6 +7,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { TestModeProvider } from './src/context/TestModeContext';
 import { RootStackParamList } from './src/navigation/types';
+import { AdminSettingsScreen } from './src/screens/AdminSettingsScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { MatchDetailScreen } from './src/screens/MatchDetailScreen';
 import { MatchListScreen } from './src/screens/MatchListScreen';
@@ -63,6 +64,11 @@ export default function App() {
               name="Player"
               component={PlayerScreen}
               options={{ title: t.playerTitle }}
+            />
+            <Stack.Screen
+              name="AdminSettings"
+              component={AdminSettingsScreen}
+              options={{ title: t.adminTitle }}
             />
           </Stack.Navigator>
         </NavigationContainer>

@@ -6,25 +6,37 @@ import { useTestMode } from '../context/TestModeContext';
 import { t } from '../i18n/strings';
 import { RootScreenProps } from '../navigation/types';
 import { useFixtures } from '../storage/useFixtures';
+import { useStreamConfig } from '../storage/useStreamConfig';
 import { colors, font, radius, spacing } from '../theme/theme';
 
 /**
- * Local demo asset only. There is intentionally no real match stream in
- * this app; a rights holder could swap this for a licensed stream URL.
+ * Bundled demo clip — the default source. A licensed stream configured
+ * in admin settings (e.g. from a beIN SPORTS agreement) takes priority.
  */
 const DEMO_VIDEO = require('../../assets/video/demo-match.mp4');
 
 export function PlayerScreen({ route }: RootScreenProps<'Player'>) {
   const { matches } = useFixtures();
   const { enabled: testMode } = useTestMode();
+  const { config: streamConfig } = useStreamConfig();
   const [videoReady, setVideoReady] = useState(false);
   const [videoError, setVideoError] = useState(false);
 
   const match = matches.find((m) => m.id === route.params.matchId);
 
-  // Defensive guard: this screen is only reachable when test mode is on,
-  // but never play anything if the local flag is off.
-  if (!testMode) {
+  const licensedUrl = streamConfig?.url;
+  const source = licensedUrl
+    ? {
+        uri: licensedUrl,
+        headers: streamConfig?.token
+          ? { Authorization: `Bearer ${streamConfig.token}` }
+          : undefined,
+      }
+    : DEMO_VIDEO;
+
+  // Defensive guard: play nothing unless the local *6 test mode is on
+  // or a licensed stream has been configured in admin settings.
+  if (!testMode && !licensedUrl) {
     return (
       <View style={styles.centered}>
         <Text style={styles.lockedText}>{t.contentLocked}</Text>
@@ -36,7 +48,11 @@ export function PlayerScreen({ route }: RootScreenProps<'Player'>) {
   return (
     <View style={styles.screen}>
       <View style={styles.banner}>
-        <Text style={styles.bannerText}>{t.demoBanner}</Text>
+        <Text style={styles.bannerText}>
+          {licensedUrl && streamConfig
+            ? t.licensedBanner(streamConfig.provider)
+            : t.demoBanner}
+        </Text>
       </View>
 
       {match && (
@@ -56,7 +72,7 @@ export function PlayerScreen({ route }: RootScreenProps<'Player'>) {
         ) : (
           <Video
             style={styles.video}
-            source={DEMO_VIDEO}
+            source={source}
             useNativeControls
             resizeMode={ResizeMode.CONTAIN}
             shouldPlay
@@ -67,7 +83,7 @@ export function PlayerScreen({ route }: RootScreenProps<'Player'>) {
         )}
       </View>
 
-      <Text style={styles.legal}>{t.legalFooter}</Text>
+      {!licensedUrl && <Text style={styles.legal}>{t.legalFooter}</Text>}
     </View>
   );
 }

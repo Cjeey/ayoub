@@ -5,6 +5,7 @@ export type RootStackParamList = {
   MatchList: undefined;
   MatchDetail: { matchId: string };
   Player: { matchId: string };
+  AdminSettings: undefined;
 };
 
 export type RootScreenProps<T extends keyof RootStackParamList> =

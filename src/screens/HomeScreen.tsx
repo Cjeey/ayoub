@@ -76,6 +76,14 @@ export function HomeScreen({ navigation }: RootScreenProps<'Home'>) {
 
         <TestModeButton />
 
+        <Pressable
+          style={({ pressed }) => [styles.settingsButton, pressed && styles.pressed]}
+          onPress={() => navigation.navigate('AdminSettings')}
+          accessibilityRole="button"
+        >
+          <Text style={styles.settingsButtonText}>{t.settingsButton}</Text>
+        </Pressable>
+
         <Text style={styles.footerNote}>📦 {t.offlineReady}</Text>
         <Text style={styles.legal}>{t.legalFooter}</Text>
       </ScrollView>
@@ -135,6 +143,18 @@ const styles = StyleSheet.create({
   allButtonText: {
     color: colors.text,
     fontSize: font.body,
+    fontWeight: '700',
+  },
+  settingsButton: {
+    alignItems: 'center',
+    borderColor: colors.cardBorder,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    padding: spacing.md,
+  },
+  settingsButtonText: {
+    color: colors.textMuted,
+    fontSize: font.small,
     fontWeight: '700',
   },
   footerNote: {
