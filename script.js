@@ -1144,8 +1144,10 @@ function openSettings() {
     ${cloud}
     <button class="btn-ghost" id="st-pin">Change passcode</button>
     <button class="btn-ghost" id="st-export">Export my data (JSON)</button>
+    <button class="btn-ghost" id="st-import">Import data (restore backup)</button>
     <button class="btn-ghost del" id="st-wipe">Wipe everything</button>
   `);
+  $('#st-import').onclick = openImport;
   $('#st-pin').onclick = () => { db.settings.passcode = null; save(); closeSheet(); startLock(); };
   $('#st-export').onclick = () => {
     const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
@@ -1158,6 +1160,55 @@ function openSettings() {
   const code = $('#st-code'); if (code) code.onclick = () => showCode();
   const syncnow = $('#st-syncnow'); if (syncnow) syncnow.onclick = async () => { toast('Syncing…'); try { const r = await Cloud.sync(); toast(r === 'pulled' ? 'Pulled newer data from cloud.' : 'Synced.'); renderScreen(currentScreen); openSettings(); } catch (e) { toast('Sync failed. Check connection.'); } };
   const off = $('#st-cloudoff'); if (off) off.onclick = () => { if (confirm('Turn off cloud backup on this device? Your cloud copy stays under its code; this device just stops syncing.')) { db.settings.cloudOn = false; save(true); closeSheet(); toast('Cloud backup off.'); } };
+}
+
+function openImport() {
+  const body = openSheet(`
+    <h2>Import data</h2>
+    <p class="sub">Paste a Reckon backup (JSON) or a starter file below. This merges in categories, transactions, goals, loans and recurring items. Your passcode and sync code stay as they are.</p>
+    <div class="field"><label>Backup JSON</label><textarea id="imp-txt" rows="7" placeholder='{ "goals": [...], "loans": [...] }' style="width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;color:var(--text);font-family:ui-monospace,monospace;font-size:13px;resize:vertical"></textarea></div>
+    <div class="field"><label>Or upload a file</label><input id="imp-file" type="file" accept="application/json,.json" /></div>
+    <div class="seg" style="margin-bottom:14px">
+      <button data-mode="merge" class="on">Merge (add to what's here)</button>
+      <button data-mode="replace">Replace everything</button>
+    </div>
+    <button class="btn-primary" id="imp-go">Import</button>
+    <button class="btn-ghost" data-close>Cancel</button>
+  `);
+  let mode = 'merge';
+  body.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => { mode = b.dataset.mode; body.querySelectorAll('[data-mode]').forEach(x => x.classList.toggle('on', x === b)); });
+  $('#imp-file').onchange = (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const rd = new FileReader(); rd.onload = () => { $('#imp-txt').value = rd.result; }; rd.readAsText(f);
+  };
+  $('#imp-go').onclick = () => {
+    let data; try { data = JSON.parse($('#imp-txt').value.trim()); }
+    catch (e) { toast('That isn\'t valid JSON.'); return; }
+    if (typeof data !== 'object' || !data) { toast('Nothing to import.'); return; }
+    importData(data, mode);
+    closeSheet(); toast('Imported.'); bootApp();
+  };
+}
+function importData(data, mode) {
+  const arrays = ['tx', 'goals', 'loans', 'recurring', 'categories'];
+  if (mode === 'replace') {
+    const keepPin = db.settings.passcode, keepCode = db.settings.syncCode, keepCloud = db.settings.cloudOn;
+    db = { ...DEFAULTS(), ...data };
+    db.settings = { ...DEFAULTS().settings, ...(data.settings || {}), passcode: keepPin, syncCode: keepCode, cloudOn: keepCloud };
+  } else {
+    // merge: append arrays (skip exact id dupes), take scalar settings we care about
+    for (const k of arrays) {
+      if (!Array.isArray(data[k])) continue;
+      const have = new Set((db[k] || []).map(x => x.id));
+      for (const item of data[k]) {
+        if (k === 'categories' && db.categories.some(c => c.id === item.id)) continue;
+        if (item.id && have.has(item.id)) continue;
+        (db[k] = db[k] || []).push(item);
+      }
+    }
+    if (data.settings && typeof data.settings.rate === 'number') db.settings.rate = data.settings.rate;
+  }
+  save();
 }
 
 function relTime(ms) {
