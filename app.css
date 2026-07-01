@@ -108,6 +108,25 @@ input, select { font-family: inherit; }
 .stat-value { font-size: 22px; font-weight: 700; margin-top: 4px; }
 .stat-bad .stat-value { color: var(--bad); }
 
+/* ===================== Trend chart ===================== */
+.trend-card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 16px; padding: 16px 14px 12px; margin-bottom: 4px;
+}
+.trend-head { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:14px; }
+.trend-title { font-size: 12px; letter-spacing:.5px; text-transform:uppercase; color: var(--muted); }
+.trend-legend { font-size: 11px; color: var(--dim); display:flex; gap:10px; }
+.trend-legend i { font-style:normal; display:inline-flex; align-items:center; gap:4px; }
+.trend-legend .sw { width:9px; height:9px; border-radius:3px; display:inline-block; }
+.trend-bars { display:flex; align-items:flex-end; gap:8px; height:120px; }
+.tb { flex:1; display:flex; flex-direction:column; align-items:center; gap:6px; height:100%; justify-content:flex-end; }
+.tb .col { width:100%; max-width:34px; display:flex; flex-direction:column-reverse; border-radius:6px 6px 3px 3px; overflow:hidden; background: var(--card-2); }
+.tb .col .good { background: #3a4a6b; }
+.tb .col .bad { background: var(--bad); }
+.tb .lbl { font-size:10.5px; color: var(--dim); }
+.tb.cur .lbl { color: var(--text); font-weight:600; }
+.tb .val { font-size:10px; color: var(--muted); }
+
 /* ===================== Verdict (harsh copy) ===================== */
 .verdict {
   border-radius: 14px; padding: 14px 16px; margin-bottom: 18px;
@@ -334,3 +353,15 @@ input, select { font-family: inherit; }
 
 .settings-link { text-align:center; padding: 20px; }
 .settings-link button { color: var(--muted); font-size: 13px; text-decoration: underline; }
+
+/* cloud */
+.cloud-box { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+.cloud-box.on { border-color: #1f5040; background: var(--good-soft); }
+.cloud-row { display:flex; align-items:center; justify-content:space-between; font-size:15px; }
+.cloud-status { font-size: 12.5px; color: var(--muted); margin: 8px 0 12px; line-height: 1.45; }
+.cloud-dot { width:9px; height:9px; border-radius:50%; background: var(--good); box-shadow:0 0 8px var(--good); }
+.code-box {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 16px; letter-spacing: .5px;
+  background: var(--card-2); border: 1px dashed var(--accent); border-radius: 12px;
+  padding: 16px; text-align: center; margin: 4px 0 14px; word-break: break-all; color: var(--text);
+}

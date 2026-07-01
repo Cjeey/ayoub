@@ -14,24 +14,35 @@ const KEY = 'reckon.v1';
 
 const DEFAULTS = () => ({
   settings: {
-    passcode: null,            // set on first run
+    passcode: null,            // set on first run (local device lock only)
     mainCurrency: 'GBP',       // totals shown in £
     tone: 'harsh',
     rate: 12.5,                // MAD per 1 GBP (fallback / manual)
     rateLive: true,
     rateFetched: null,
+    cloudOn: false,            // cloud backup enabled
+    syncCode: null,            // secret vault key (local)
+    lastSync: null,            // last successful cloud sync (ms)
   },
   categories: [
     { id: 'food',   name: 'Food & groceries', emoji: '🛒', limit: 250, essential: true },
-    { id: 'trans',  name: 'Transport',        emoji: '🚌', limit: 80,  essential: true },
     { id: 'eat',    name: 'Eating out',       emoji: '🍔', limit: 60,  essential: false },
+    { id: 'trans',  name: 'Transport',        emoji: '🚌', limit: 80,  essential: true },
+    { id: 'bills',  name: 'Bills & rent',     emoji: '🧾', limit: 500, essential: true },
+    { id: 'subs',   name: 'Subscriptions',    emoji: '📺', limit: 40,  essential: false },
     { id: 'fun',    name: 'Shopping & fun',   emoji: '🛍️', limit: 50,  essential: false },
-    { id: 'bills',  name: 'Bills',            emoji: '🧾', limit: 200, essential: true },
+    { id: 'coffee', name: 'Coffee & snacks',  emoji: '☕', limit: 30,  essential: false },
+    { id: 'health', name: 'Health',           emoji: '💊', limit: 40,  essential: true },
+    { id: 'going',  name: 'Going out',        emoji: '🍻', limit: 60,  essential: false },
+    { id: 'phone',  name: 'Phone & internet', emoji: '📱', limit: 40,  essential: true },
+    { id: 'gifts',  name: 'Gifts & family',   emoji: '🎁', limit: 0,   essential: false },
     { id: 'other',  name: 'Other',            emoji: '•',  limit: 0,   essential: false },
   ],
-  tx: [],       // { id, kind:'expense'|'income', amount, cur:'GBP'|'MAD', cat, note, regret:null|'stupid'|'worth', date }
-  goals: [],    // { id, name, target, cur, saved }
-  loans: [],    // { id, dir:'owe'|'owed', who, amount, cur, due, settled:false }
+  tx: [],         // { id, kind:'expense'|'income', amount, cur, cat, note, regret, date }
+  goals: [],      // { id, name, target, cur, saved }
+  loans: [],      // { id, dir:'owe'|'owed', who, amount, cur, due, settled }
+  recurring: [],  // { id, name, amount, cur, cat, kind, day, active, lastPosted:'YYYY-M' }
+  _rev: null,     // ISO string, bumped on every save() — drives cloud last-write-wins
 });
 
 let db = load();
@@ -48,13 +59,118 @@ function load() {
     return DEFAULTS();
   }
 }
-function save() {
+function save(skipCloud) {
+  db._rev = new Date().toISOString();
   try { localStorage.setItem(KEY, JSON.stringify(db)); }
   catch (e) { console.warn('save failed', e); }
-  // TODO(cloud): mirror to Supabase here (upsert per-collection) when wired.
+  if (!skipCloud && db.settings.cloudOn && db.settings.syncCode) Cloud.pushSoon();
 }
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+/* ------------------------------------------------------------------ *
+ * Cloud — secret-code vault sync via Supabase RPC (no login needed).  *
+ * The publishable key is safe to embed; the vault is unreachable      *
+ * without the long random syncCode.                                   *
+ * ------------------------------------------------------------------ */
+const SUPABASE_URL = 'https://sjxixnltjxpygcvxmfrx.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_Pcuq62al1sYYAAW7HzYHSA_xoHcCYe4';
+
+const Cloud = {
+  _timer: null,
+  _busy: false,
+
+  makeCode() {
+    const bytes = new Uint8Array(24);
+    (self.crypto || window.crypto).getRandomValues(bytes);
+    const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+    let s = '';
+    for (const b of bytes) s += abc[b % abc.length];   // 24 chars, ~118 bits
+    return 'rk-' + s.slice(0, 6) + '-' + s.slice(6, 12) + '-' + s.slice(12, 18) + '-' + s.slice(18, 24);
+  },
+
+  // strip local-only settings before it leaves the device
+  payload() {
+    const copy = JSON.parse(JSON.stringify(db));
+    delete copy.settings.passcode;
+    delete copy.settings.syncCode;
+    delete copy.settings.cloudOn;
+    delete copy.settings.lastSync;
+    return copy;
+  },
+
+  async rpc(fn, body) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`${fn} ${r.status}`);
+    return r.json();
+  },
+
+  async push() {
+    if (!db.settings.cloudOn || !db.settings.syncCode) return;
+    this._busy = true;
+    try {
+      await this.rpc('vault_push', {
+        p_code: db.settings.syncCode,
+        p_data: this.payload(),
+        p_updated_at: db._rev || new Date().toISOString(),
+      });
+      db.settings.lastSync = Date.now();
+      save(true);
+      renderCloudStatus();
+    } catch (e) { console.warn('cloud push failed', e); renderCloudStatus('error'); }
+    finally { this._busy = false; }
+  },
+
+  pushSoon() {
+    clearTimeout(this._timer);
+    this._timer = setTimeout(() => this.push(), 1500);
+  },
+
+  // pull remote; adopt it if it's newer than local. returns 'pulled'|'pushed'|'same'
+  async sync() {
+    if (!db.settings.syncCode) throw new Error('no code');
+    const rows = await this.rpc('vault_pull', { p_code: db.settings.syncCode });
+    const remote = Array.isArray(rows) ? rows[0] : rows;
+    const localRev = db._rev ? Date.parse(db._rev) : 0;
+    if (remote && remote.data) {
+      const remoteRev = remote.updated_at ? Date.parse(remote.updated_at) : 0;
+      if (remoteRev > localRev) {
+        const incoming = remote.data;
+        // keep local-only settings, take everything else from cloud
+        const localOnly = {
+          passcode: db.settings.passcode, syncCode: db.settings.syncCode,
+          cloudOn: true, lastSync: Date.now(),
+        };
+        db = { ...DEFAULTS(), ...incoming };
+        db.settings = { ...DEFAULTS().settings, ...(incoming.settings || {}), ...localOnly };
+        save(true);
+        return 'pulled';
+      }
+    }
+    await this.push();
+    return remote && remote.data ? 'pushed' : 'pushed';
+  },
+
+  // link this device to an existing code: always adopt the remote copy
+  async link(code) {
+    db.settings.syncCode = code.trim();
+    const rows = await this.rpc('vault_pull', { p_code: db.settings.syncCode });
+    const remote = Array.isArray(rows) ? rows[0] : rows;
+    if (!remote || !remote.data) { db.settings.syncCode = null; throw new Error('No vault found for that code.'); }
+    const localOnly = { passcode: db.settings.passcode, syncCode: db.settings.syncCode, cloudOn: true, lastSync: Date.now() };
+    db = { ...DEFAULTS(), ...remote.data };
+    db.settings = { ...DEFAULTS().settings, ...(remote.data.settings || {}), ...localOnly };
+    save(true);
+  },
+};
 
 /* ------------------------------------------------------------------ *
  * Currency helpers — everything reduces to GBP for the big numbers.  *
@@ -188,6 +304,31 @@ function unlock() {
   bootApp();
 }
 
+/* ------------------------------------------------------------------ *
+ * Recurring — auto-log monthly bills/income once their day arrives.   *
+ * ------------------------------------------------------------------ */
+function postRecurring() {
+  const t = now();
+  const mk = thisMonth();
+  let posted = 0;
+  for (const r of db.recurring || []) {
+    if (!r.active) continue;
+    if (r.lastPosted === mk) continue;
+    if (t.getDate() < (r.day || 1)) continue;         // day hasn't arrived yet
+    const date = new Date(t.getFullYear(), t.getMonth(), Math.min(r.day || 1, 28), 9, 0, 0);
+    db.tx.unshift({
+      id: uid(), kind: r.kind || 'expense',
+      amount: r.amount, cur: r.cur,
+      cat: r.kind === 'income' ? 'income' : r.cat,
+      note: r.name + ' (auto)', regret: null,
+      date: date.toISOString(), auto: true,
+    });
+    r.lastPosted = mk; posted++;
+  }
+  if (posted) save();
+  return posted;
+}
+
 /* ==================================================================== *
  *  NAVIGATION                                                          *
  * ==================================================================== */
@@ -240,8 +381,54 @@ function renderHome() {
   $('#stat-wasted').textContent = fmtGBP(wasted);
 
   renderVerdict(spent, wasted, exp);
+  renderTrend();
   renderHomeCats(exp);
   renderRecent();
+}
+
+/* 6-month spending trend, splitting wasted (red) from the rest. */
+function renderTrend() {
+  const card = $('#trend-card');
+  const months = [];
+  const base = now();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
+    months.push({ key: monthKey(d), label: d.toLocaleDateString(undefined, { month: 'short' }), total: 0, waste: 0 });
+  }
+  const idx = {}; months.forEach((m, i) => idx[m.key] = i);
+  for (const t of db.tx) {
+    if (t.kind !== 'expense') continue;
+    const k = monthKey(new Date(t.date));
+    if (!(k in idx)) continue;
+    const g = toGBP(t.amount, t.cur);
+    months[idx[k]].total += g;
+    if (t.regret === 'stupid') months[idx[k]].waste += g;
+  }
+  const max = Math.max(1, ...months.map(m => m.total));
+  if (months.every(m => m.total === 0)) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  const bars = months.map((m, i) => {
+    const h = Math.round(m.total / max * 100);
+    const wh = m.total ? Math.round(m.waste / m.total * 100) : 0;
+    const cur = i === months.length - 1;
+    return `<div class="tb ${cur ? 'cur' : ''}">
+      <div class="col" style="height:${Math.max(3, h)}%">
+        <span class="good" style="height:${100 - wh}%"></span>
+        <span class="bad" style="height:${wh}%"></span>
+      </div>
+      <div class="val">${m.total ? fmtGBP(m.total) : ''}</div>
+      <div class="lbl">${m.label}</div>
+    </div>`;
+  }).join('');
+  card.innerHTML =
+    `<div class="trend-head">
+       <span class="trend-title">Last 6 months</span>
+       <span class="trend-legend">
+         <i><span class="sw" style="background:#3a4a6b"></span>spent</i>
+         <i><span class="sw" style="background:var(--bad)"></span>wasted</i>
+       </span>
+     </div>
+     <div class="trend-bars">${bars}</div>`;
 }
 
 function renderVerdict(spent, wasted, exp) {
@@ -338,6 +525,7 @@ function txRow(t) {
  *  SPEND                                                               *
  * ==================================================================== */
 function renderSpend() {
+  renderRecurList();
   const exp = monthExpenses();
   const spentBy = {};
   for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
@@ -348,6 +536,66 @@ function renderSpend() {
   const all = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date));
   if (!all.length) { list.appendChild(el('div', 'empty', 'No transactions yet.')); return; }
   for (const t of all.slice(0, 100)) list.appendChild(txRow(t));
+}
+
+/* ---------- Recurring list + editor ---------- */
+function renderRecurList() {
+  const box = $('#recur-list'); box.innerHTML = '';
+  const list = db.recurring || [];
+  if (!list.length) { box.appendChild(el('div', 'empty', 'No recurring items. Add rent, subs, salary — they log themselves each month.')); return; }
+  for (const r of list) {
+    const c = r.kind === 'income' ? { name: 'Income', emoji: '💰' } : catById(r.cat);
+    const card = el('div', 'loan');
+    card.innerHTML =
+      `<div class="loan-top">
+         <div class="loan-who">${c.emoji} ${esc(r.name)}</div>
+         <div class="loan-amt" style="color:${r.kind === 'income' ? 'var(--good)' : 'var(--text)'}">${r.kind === 'income' ? '+' : ''}${fmt(r.amount, r.cur)}</div>
+       </div>
+       <div class="loan-meta"><span>Day ${r.day} each month</span>${r.active ? '' : '<span class="overdue">Paused</span>'}${r.cur !== 'GBP' ? `<span>≈ ${fmtGBP(toGBP(r.amount, r.cur))}</span>` : ''}</div>
+       <div class="loan-actions"><button class="gbtn" data-edit>Edit</button></div>`;
+    card.querySelector('[data-edit]').addEventListener('click', () => openRecur(r));
+    box.appendChild(card);
+  }
+}
+function openRecur(r) {
+  const isNew = !r;
+  r = r || { id: uid(), name: '', amount: '', cur: db.settings.mainCurrency, cat: 'bills', kind: 'expense', day: 1, active: true, lastPosted: null, _new: true };
+  const cats = db.categories.filter(c => c.id !== 'other').map(c =>
+    `<option value="${c.id}" ${r.cat === c.id ? 'selected' : ''}>${c.emoji} ${esc(c.name)}</option>`).join('');
+  const body = openSheet(`
+    <h2>${isNew ? 'New recurring item' : 'Edit recurring'}</h2>
+    <p class="sub">Auto-logs on its day each month. Great for rent, subscriptions, salary.</p>
+    <div class="seg" style="margin-bottom:14px">
+      <button data-k="expense" class="${r.kind==='expense'?'on neg':''}">Expense</button>
+      <button data-k="income" class="${r.kind==='income'?'on pos':''}">Income</button>
+    </div>
+    <div class="field"><label>Name</label><input id="rc-name" type="text" placeholder="e.g. Rent, Netflix, Salary" value="${esc(r.name)}" /></div>
+    <div class="field"><label>Amount</label><input id="rc-amt" type="number" inputmode="decimal" placeholder="0" value="${r.amount || ''}" /></div>
+    <div class="field"><label>Currency</label>
+      <div class="seg"><button data-c="GBP" class="${r.cur==='GBP'?'on':''}">£ GBP</button><button data-c="MAD" class="${r.cur==='MAD'?'on':''}">د.م MAD</button></div>
+    </div>
+    <div class="field" id="rc-catwrap" ${r.kind==='income'?'style="display:none"':''}><label>Category</label><select id="rc-cat">${cats}</select></div>
+    <div class="field"><label>Day of month (1–28)</label><input id="rc-day" type="number" inputmode="numeric" min="1" max="28" value="${r.day || 1}" /></div>
+    <div class="field"><label>Status</label>
+      <div class="seg"><button data-a="1" class="${r.active?'on pos':''}">Active</button><button data-a="0" class="${!r.active?'on':''}">Paused</button></div>
+    </div>
+    <button class="btn-primary" id="rc-save">${isNew ? 'Add' : 'Save'}</button>
+    ${isNew ? '' : '<button class="btn-ghost del" id="rc-del">Delete</button>'}
+  `);
+  let kind = r.kind, cur = r.cur, active = r.active;
+  body.querySelectorAll('[data-k]').forEach(b => b.onclick = () => { kind = b.dataset.k; body.querySelectorAll('[data-k]').forEach(x => x.className = ''); b.className = 'on ' + (kind === 'income' ? 'pos' : 'neg'); $('#rc-catwrap').style.display = kind === 'income' ? 'none' : ''; });
+  body.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { cur = b.dataset.c; body.querySelectorAll('[data-c]').forEach(x => x.classList.toggle('on', x === b)); });
+  body.querySelectorAll('[data-a]').forEach(b => b.onclick = () => { active = b.dataset.a === '1'; body.querySelectorAll('[data-a]').forEach(x => x.className = ''); b.className = 'on ' + (active ? 'pos' : ''); });
+  $('#rc-save').onclick = () => {
+    const name = $('#rc-name').value.trim(); const amt = parseFloat($('#rc-amt').value);
+    if (!name) { toast('Name it.'); return; } if (!amt || amt <= 0) { toast('Amount?'); return; }
+    r.name = name; r.amount = Math.round(amt * 100) / 100; r.cur = cur; r.kind = kind;
+    r.cat = kind === 'income' ? 'income' : $('#rc-cat').value;
+    r.day = Math.min(28, Math.max(1, parseInt($('#rc-day').value) || 1)); r.active = active;
+    if (r._new) { delete r._new; db.recurring.push(r); }
+    save(); closeSheet(); postRecurring(); renderSpend();
+  };
+  const del = $('#rc-del'); if (del) del.onclick = () => { if (confirm('Delete this recurring item? Past logged entries stay.')) { db.recurring = db.recurring.filter(x => x.id !== r.id); save(); closeSheet(); renderSpend(); } };
 }
 
 /* ==================================================================== *
@@ -787,13 +1035,28 @@ function openRate() {
   $('#open-settings').onclick = openSettings;
 }
 function openSettings() {
+  const s = db.settings;
+  const cloud = s.cloudOn
+    ? `<div class="cloud-box on">
+         <div class="cloud-row"><b>☁︎ Cloud backup is ON</b><span class="cloud-dot" id="cloud-dot"></span></div>
+         <div class="cloud-status" id="cloud-status">${s.lastSync ? 'Last synced ' + relTime(s.lastSync) : 'Not synced yet'}</div>
+         <button class="btn-ghost" id="st-code">Show my sync code</button>
+         <button class="btn-ghost" id="st-syncnow">Sync now</button>
+         <button class="btn-ghost del" id="st-cloudoff">Turn off cloud backup</button>
+       </div>`
+    : `<div class="cloud-box">
+         <div class="cloud-row"><b>☁︎ Cloud backup is OFF</b></div>
+         <div class="cloud-status">Your data lives only on this phone. Turn on backup to survive phone loss and sync across devices — no email needed.</div>
+         <button class="btn-primary" id="st-cloudon">Turn on cloud backup</button>
+         <button class="btn-ghost" id="st-link">I already have a sync code</button>
+       </div>`;
   const body = openSheet(`
     <h2>Settings</h2>
-    <p class="sub">Reckon v1 · data stored on this device.</p>
-    <button class="btn-primary" id="st-pin">Change passcode</button>
-    <button class="btn-ghost" id="st-export">Export my data (backup)</button>
+    <p class="sub">Reckon · your money, honestly.</p>
+    ${cloud}
+    <button class="btn-ghost" id="st-pin">Change passcode</button>
+    <button class="btn-ghost" id="st-export">Export my data (JSON)</button>
     <button class="btn-ghost del" id="st-wipe">Wipe everything</button>
-    <div class="settings-link">Cloud backup (sync across devices) coming next.</div>
   `);
   $('#st-pin').onclick = () => { db.settings.passcode = null; save(); closeSheet(); startLock(); };
   $('#st-export').onclick = () => {
@@ -801,7 +1064,63 @@ function openSettings() {
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded.');
   };
-  $('#st-wipe').onclick = () => { if (confirm('Wipe ALL data permanently?')) { localStorage.removeItem(KEY); db = DEFAULTS(); closeSheet(); startLock(); } };
+  $('#st-wipe').onclick = () => { if (confirm('Wipe ALL data permanently? If cloud backup is on, your cloud copy stays under its code.')) { localStorage.removeItem(KEY); db = DEFAULTS(); closeSheet(); startLock(); } };
+  const on = $('#st-cloudon'); if (on) on.onclick = cloudTurnOn;
+  const link = $('#st-link'); if (link) link.onclick = cloudLinkSheet;
+  const code = $('#st-code'); if (code) code.onclick = () => showCode();
+  const syncnow = $('#st-syncnow'); if (syncnow) syncnow.onclick = async () => { toast('Syncing…'); try { const r = await Cloud.sync(); toast(r === 'pulled' ? 'Pulled newer data from cloud.' : 'Synced.'); renderScreen(currentScreen); openSettings(); } catch (e) { toast('Sync failed. Check connection.'); } };
+  const off = $('#st-cloudoff'); if (off) off.onclick = () => { if (confirm('Turn off cloud backup on this device? Your cloud copy stays under its code; this device just stops syncing.')) { db.settings.cloudOn = false; save(true); closeSheet(); toast('Cloud backup off.'); } };
+}
+
+function relTime(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function renderCloudStatus(state) {
+  const st = $('#cloud-status'); if (st) st.textContent = state === 'error' ? 'Last sync failed — will retry.' : (db.settings.lastSync ? 'Last synced ' + relTime(db.settings.lastSync) : 'Not synced yet');
+}
+
+async function cloudTurnOn() {
+  const code = Cloud.makeCode();
+  db.settings.syncCode = code; db.settings.cloudOn = true;
+  save(true);
+  try { await Cloud.push(); } catch (e) {}
+  showCode(true);
+}
+function showCode(firstTime) {
+  const code = db.settings.syncCode;
+  openSheet(`
+    <h2>${firstTime ? 'Cloud backup is on 🎉' : 'Your sync code'}</h2>
+    <p class="sub">This code <b>is</b> the key to your data. To open your money on another phone, install Reckon there and enter this exact code. Anyone with it can see your data — keep it private, and don't lose it (there's no email reset).</p>
+    <div class="code-box" id="code-box">${esc(code)}</div>
+    <button class="btn-primary" id="cp-copy">Copy code</button>
+    <button class="btn-ghost" data-close>Done</button>
+  `);
+  $('#cp-copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(code); toast('Copied. Store it somewhere safe.'); }
+    catch (e) { toast('Select the code and copy it manually.'); }
+  };
+}
+function cloudLinkSheet() {
+  const body = openSheet(`
+    <h2>Link this device</h2>
+    <p class="sub">Enter the sync code from your other phone to pull your data here. This replaces whatever's on this device.</p>
+    <div class="field"><label>Sync code</label><input id="lk-code" type="text" placeholder="rk-xxxxxx-xxxxxx-…" autocapitalize="off" autocomplete="off" /></div>
+    <button class="btn-primary" id="lk-go">Pull my data</button>
+    <button class="btn-ghost" data-close>Cancel</button>
+  `);
+  $('#lk-go').onclick = async () => {
+    const c = $('#lk-code').value.trim();
+    if (c.length < 16) { toast('That code looks too short.'); return; }
+    if (db.tx.length && !confirm('This will replace the data currently on this device with the cloud copy. Continue?')) return;
+    toast('Linking…');
+    try { await Cloud.link(c); closeSheet(); toast('Linked. Your data is here.'); bootApp(); }
+    catch (e) { toast(e.message || 'Could not link. Check the code.'); }
+  };
+  setTimeout(() => $('#lk-code') && $('#lk-code').focus(), 150);
 }
 
 /* ==================================================================== *
@@ -825,10 +1144,17 @@ function bindOnce() {
     else if (id === 'add-goal') openGoal(null);
     else if (id === 'add-owe') newLoan('owe');
     else if (id === 'add-owed') newLoan('owed');
+    else if (id === 'add-recur') openRecur(null);
   });
 }
 
-function bootApp() {
+async function bootApp() {
+  // Cloud first: adopt a newer remote copy before we render or post recurring.
+  if (db.settings.cloudOn && db.settings.syncCode) {
+    try { await Cloud.sync(); } catch (e) { console.warn('boot sync failed', e); }
+  }
+  postRecurring();
+
   const h = now().getHours();
   const hi = h < 5 ? 'Still up?' : h < 12 ? 'Morning' : h < 18 ? 'Afternoon' : 'Evening';
   $('#greeting').textContent = hi;
