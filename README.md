@@ -35,12 +35,13 @@ app itself.
 
 ## The intelligent layer
 
-- **✦ AI Coach** — a chat tab where you ask anything ("can I afford £25
-  tonight?", "plan my way out of debt") and it answers with your *actual*
-  numbers: full memory of your history, goals, loans, patterns and regrets.
-  Runs on **your own Google AI Studio (Gemini) key**, pasted once in the
-  Coach tab. The key is stored **only on your device** — it is stripped from
-  cloud sync, and the app talks to Google directly (no middleman server).
+- **✦ AI Coach** — reachable from the "Ask your AI coach" card on Home or the
+  ✦ button in the top bar. Ask anything ("can I afford £25 tonight?", "plan my
+  way out of debt") and it answers with your *actual* numbers: full memory of
+  your history, goals, loans, patterns and regrets. Runs on **your own OpenAI
+  (`sk-…`) or Google AI (`AIza…`) key** — paste either and the app routes to
+  the right provider automatically. The key is stored **only on your device**,
+  stripped from cloud sync, and sent straight to the provider (no middleman).
 - **⚡ Type-to-log** — in the add sheet, type `45 dh taxi` or `coffee 3.50`
   and it fills amount/currency/category itself. Common patterns parse
   locally and instantly; anything weird falls back to the AI when connected.

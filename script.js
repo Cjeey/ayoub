@@ -20,7 +20,7 @@ const DEFAULTS = () => ({
   settings: {
     mainCurrency: 'GBP',       // totals shown in £
     tone: 'harsh',
-    theme: 'dark',             // 'dark' | 'light'
+    theme: 'light',            // 'light' | 'dark'
     rate: 12.5,                // MAD per 1 GBP (fallback / manual)
     rateLive: true,
     rateFetched: null,
@@ -785,7 +785,45 @@ function loanCard(l) {
 /* ==================================================================== *
  *  REVIEW (weekly regret)                                               *
  * ==================================================================== */
+// CVD-safe categorical palette (from the validated dataviz reference)
+const DONUT_COLORS = ['#6c4cf0', '#199e70', '#eda100', '#e34948', '#2a78d6', '#e87ba4', '#eb6834', '#8b86a4'];
+
+function renderDonut() {
+  const card = $('#donut-card');
+  const exp = monthExpenses();
+  const by = {};
+  for (const t of exp) by[t.cat] = (by[t.cat] || 0) + toGBP(t.amount, t.cur);
+  const items = Object.entries(by).map(([id, v]) => ({ c: catById(id), v })).sort((a, b) => b.v - a.v);
+  const total = items.reduce((s, x) => s + x.v, 0);
+  if (total <= 0) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+
+  // top 7 + "Other", assign fixed palette slots
+  const top = items.slice(0, 7);
+  const rest = items.slice(7).reduce((s, x) => s + x.v, 0);
+  const slices = top.map((x, i) => ({ name: x.c.name, v: x.v, col: DONUT_COLORS[i] }));
+  if (rest > 0) slices.push({ name: 'Other', v: rest, col: DONUT_COLORS[7] });
+
+  let acc = 0; const stops = [];
+  for (const s of slices) {
+    const start = acc / total * 360, end = (acc + s.v) / total * 360;
+    stops.push(`${s.col} ${start}deg ${end}deg`);
+    acc += s.v;
+  }
+  const legend = slices.map(s =>
+    `<div class="dl"><span class="ds" style="background:${s.col}"></span><span class="dn">${esc(s.name)}</span><span class="dv">${fmtGBP(s.v)}</span></div>`).join('');
+  card.innerHTML = `
+    <div class="trend-title" style="margin-bottom:14px">Where it went this month</div>
+    <div class="donut-wrap">
+      <div class="donut" style="background:conic-gradient(${stops.join(',')})">
+        <div class="donut-hole"><div class="dh-v">${fmtGBP(total)}</div><div class="dh-l">spent</div></div>
+      </div>
+      <div class="donut-legend">${legend}</div>
+    </div>`;
+}
+
 function renderReview() {
+  renderDonut();
   renderTrend();
   const weekAgo = new Date(now() - 7 * 86400000);
   const recent = db.tx.filter(t => t.kind === 'expense' && new Date(t.date) >= weekAgo)
@@ -1233,8 +1271,8 @@ function openSettings() {
       </div>
     </div>
     <div class="set-card">
-      <div class="set-row"><span>✦ AI coach</span><b>${s.aiKey ? 'Connected' : 'Off'}</b></div>
-      <div class="set-sub">${s.aiKey ? 'Runs on your Google AI key, stored on this device only.' : 'Connect a Google AI key in the Coach tab to chat with your money.'}</div>
+      <div class="set-row"><span>✦ AI coach</span><b>${s.aiKey ? esc(AI.label()) : 'Off'}</b></div>
+      <div class="set-sub">${s.aiKey ? 'Runs on your ' + esc(AI.label()) + ' key, stored on this device only.' : 'Connect an OpenAI or Google AI key from the coach to chat with your money.'}</div>
       ${s.aiKey ? '<button class="btn-ghost" id="st-aikey">Change API key</button><button class="btn-ghost del" id="st-aioff">Disconnect AI</button>' : ''}
     </div>
     <button class="btn-ghost" id="st-export">Export my data (JSON)</button>
@@ -1248,7 +1286,7 @@ function openSettings() {
   $('#st-logout').onclick = () => { if (confirm('Log out on this device? Your data stays safe in your account.')) logout(); };
   $('#st-import').onclick = openImport;
   const aik = $('#st-aikey'); if (aik) aik.onclick = () => {
-    const k = (prompt('Paste your new Google AI Studio key:') || '').trim();
+    const k = (prompt('Paste your new API key (OpenAI sk-… or Google AIza…):') || '').trim();
     if (!k) return;
     if (k.length < 20) { toast('That doesn\'t look like a key.'); return; }
     db.settings.aiKey = k; save(true); toast('AI key updated.');
@@ -1324,16 +1362,50 @@ function importData(data, mode) {
  * ==================================================================== */
 const AI = {
   ready() { return !!db.settings.aiKey; },
+  // route by key shape: OpenAI keys start with "sk-", Google keys with "AIza"
+  provider() { return (db.settings.aiKey || '').startsWith('sk-') ? 'openai' : 'google'; },
+  label() { return this.provider() === 'openai' ? 'OpenAI' : 'Google AI'; },
 
-  async generate(contents, systemText, jsonMode) {
+  // history: [{ role: 'user'|'ai', text }]
+  async generate(history, systemText, jsonMode) {
+    return this.provider() === 'openai'
+      ? this._openai(history, systemText, jsonMode)
+      : this._google(history, systemText, jsonMode);
+  },
+
+  async _openai(history, systemText, jsonMode) {
+    const model = db.settings.openaiModel || 'gpt-4o-mini';
+    const messages = [{ role: 'system', content: systemText }]
+      .concat(history.map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text })));
+    const body = { model, messages, temperature: jsonMode ? 0.1 : 0.7, max_tokens: 1024 };
+    if (jsonMode) body.response_format = { type: 'json_object' };
+    let r;
+    try {
+      r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${db.settings.aiKey}` },
+        body: JSON.stringify(body),
+      });
+    } catch (e) { throw new Error('network'); }
+    if (r.status === 401) throw new Error('bad-key');
+    if (r.status === 429) throw new Error('rate-limit');
+    if (r.status >= 500) throw new Error('server');
+    if (!r.ok) throw new Error('ai-' + r.status);
+    const j = await r.json();
+    const text = j.choices?.[0]?.message?.content || '';
+    if (!text) throw new Error('empty');
+    return text;
+  },
+
+  async _google(history, systemText, jsonMode) {
     const model = db.settings.aiModel || 'gemini-2.5-flash';
+    const contents = history.map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
     const body = {
       contents,
       systemInstruction: { parts: [{ text: systemText }] },
-      generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+      generationConfig: { temperature: jsonMode ? 0.1 : 0.7, maxOutputTokens: 1024 },
     };
-    if (jsonMode) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.temperature = 0.1; }
-    // 2.5-series models think by default; turn it off for snappy, cheap replies
+    if (jsonMode) body.generationConfig.responseMimeType = 'application/json';
     if (model.startsWith('gemini-2.5')) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
     const call = async (b) => {
@@ -1341,15 +1413,15 @@ const AI = {
         return await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
           { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': db.settings.aiKey }, body: JSON.stringify(b) });
-      } catch (e) { throw new Error('network'); }   // fetch itself failed = actual connectivity problem
+      } catch (e) { throw new Error('network'); }
     };
     const keyRejected = async (r) => /API_KEY_INVALID|API key not valid/i.test(await r.clone().text().catch(() => ''));
 
     let r = await call(body);
     if (r.status === 400) {
-      if (await keyRejected(r)) throw new Error('bad-key');  // Google says 400, not 401, for bad keys
+      if (await keyRejected(r)) throw new Error('bad-key');
       if (body.generationConfig.thinkingConfig) {
-        delete body.generationConfig.thinkingConfig;         // model doesn't take the field — retry without
+        delete body.generationConfig.thinkingConfig;
         r = await call(body);
         if (r.status === 400 && await keyRejected(r)) throw new Error('bad-key');
       }
@@ -1449,18 +1521,18 @@ function renderCoach() {
     log.innerHTML = `
       <div class="chat-hello"><span class="big">✦</span><b>Meet your coach.</b><br>
       Ask anything about your money and get straight answers using your real numbers.
-      It runs on your own Google AI key — free tier is plenty.</div>
+      Runs on your own <b>OpenAI</b> or <b>Google AI</b> key.</div>
       <div class="ai-setup">
-        <h3>Connect Google AI</h3>
-        <p>Paste your Google AI Studio API key (aistudio.google.com → Get API key). It's stored <b>only on this phone</b> — never synced, never sent anywhere except Google.</p>
-        <div class="field"><label>API key</label><input id="ai-key" type="password" placeholder="AIza…" autocomplete="off" /></div>
+        <h3>Connect your AI</h3>
+        <p>Paste an <b>OpenAI</b> key (<code>sk-…</code>, platform.openai.com) or a <b>Google AI</b> key (<code>AIza…</code>, aistudio.google.com). Stored <b>only on this device</b> — never synced, sent only to the provider.</p>
+        <div class="field"><label>API key</label><input id="ai-key" type="password" placeholder="sk-… or AIza…" autocomplete="off" /></div>
         <button class="btn-primary" id="ai-save">Connect</button>
       </div>`;
     $('#ai-save').onclick = () => {
       const k = $('#ai-key').value.trim();
       if (k.length < 20) { toast('That doesn\'t look like a key.'); return; }
       db.settings.aiKey = k; save(true);
-      toast('Connected. Ask away.');
+      toast(`Connected to ${AI.label()}. Ask away.`);
       renderCoach();
     };
     return;
@@ -1512,7 +1584,7 @@ async function sendChat() {
   chatBusy = true; $('#chat-send').disabled = true;
 
   try {
-    const history = db.coach.messages.filter(m => !m.err).slice(-12).map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
+    const history = db.coach.messages.filter(m => !m.err).slice(-12).map(m => ({ role: m.role === 'user' ? 'user' : 'ai', text: m.text }));
     const reply = await AI.generate(history, buildCoachContext(), false);
     db.coach.messages.push({ role: 'ai', text: reply.trim() });
     if (db.coach.messages.length > 40) db.coach.messages = db.coach.messages.slice(-40);
@@ -1566,7 +1638,7 @@ function parseQuick(raw) {
 async function parseQuickAI(raw) {
   const catIds = db.categories.map(c => `"${c.id}" (${c.name})`).join(', ');
   const sys = `Parse a money note into strict JSON: {"kind":"expense"|"income","amount":number,"currency":"GBP"|"MAD","category":string,"note":string}. Category must be one of: ${catIds}. "dh"/"dirham" means MAD; default currency GBP. note = short human description. Reply with JSON only.`;
-  const text = await AI.generate([{ role: 'user', parts: [{ text: raw }] }], sys, true);
+  const text = await AI.generate([{ role: 'user', text: raw }], sys, true);
   const p = JSON.parse(text);
   if (!p || typeof p.amount !== 'number' || p.amount <= 0) throw new Error('bad-parse');
   return {
@@ -1708,6 +1780,7 @@ function bindOnce() {
   // topbar actions
   $('#rate-chip').onclick = openRate;
   $('#coach-btn').onclick = () => go('coach');
+  $('#coach-card').onclick = () => go('coach');
   // coach chat
   $('#chat-send').onclick = sendChat;
   $('#chat-in').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
@@ -1725,10 +1798,10 @@ function bindOnce() {
 }
 
 function applyTheme() {
-  const t = (db.settings && db.settings.theme) || 'dark';
+  const t = (db.settings && db.settings.theme) || 'light';
   document.documentElement.setAttribute('data-theme', t);
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', t === 'light' ? '#f3f5f9' : '#0b0d12');
+  if (meta) meta.setAttribute('content', t === 'light' ? '#f6f5fc' : '#0f0e17');
 }
 
 async function bootApp() {
