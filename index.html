@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <meta name="theme-color" content="#0d0f14" />
+  <meta name="theme-color" content="#0b0d12" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Reckon — money, honestly</title>
@@ -11,26 +11,22 @@
   <link rel="stylesheet" href="app.css" />
 </head>
 <body>
-  <!-- ===================== LOCK SCREEN ===================== -->
-  <section id="lock" class="lock hidden">
-    <div class="lock-box">
-      <div class="lock-logo">₤</div>
-      <h1 class="lock-title">Reckon</h1>
-      <p id="lock-sub" class="lock-sub">Enter your passcode.</p>
-      <div id="pin-dots" class="pin-dots"></div>
-      <div class="keypad">
-        <button class="key" data-k="1">1</button>
-        <button class="key" data-k="2">2</button>
-        <button class="key" data-k="3">3</button>
-        <button class="key" data-k="4">4</button>
-        <button class="key" data-k="5">5</button>
-        <button class="key" data-k="6">6</button>
-        <button class="key" data-k="7">7</button>
-        <button class="key" data-k="8">8</button>
-        <button class="key" data-k="9">9</button>
-        <button class="key key-ghost" data-k="reset">↺</button>
-        <button class="key" data-k="0">0</button>
-        <button class="key key-ghost" data-k="del">⌫</button>
+  <!-- ===================== AUTH SCREEN ===================== -->
+  <section id="auth" class="auth hidden">
+    <div class="auth-box">
+      <div class="auth-logo">₤</div>
+      <h1 class="auth-brand">Reckon</h1>
+      <p class="auth-tag">Money, honestly.</p>
+      <div class="auth-card">
+        <h2 id="auth-title">Welcome back</h2>
+        <p id="auth-sub" class="auth-sub">Log in to your money.</p>
+        <div class="field"><label>Email</label>
+          <input id="auth-email" type="email" inputmode="email" autocomplete="email" autocapitalize="off" placeholder="you@email.com" /></div>
+        <div class="field"><label>Password</label>
+          <input id="auth-pw" type="password" autocomplete="current-password" placeholder="••••••••" /></div>
+        <div id="auth-err" class="auth-err"></div>
+        <button id="auth-submit" class="btn-primary">Log in</button>
+        <button id="auth-switch" class="auth-switch">New here? <b>Create an account</b></button>
       </div>
     </div>
   </section>
@@ -42,36 +38,27 @@
         <div class="topbar-hi" id="greeting">Reckon</div>
         <div class="topbar-sub" id="topbar-sub">the honest ledger</div>
       </div>
-      <button class="rate-chip" id="rate-chip" title="Exchange rate">£/د.م</button>
+      <div class="topbar-actions">
+        <span class="sync-dot" id="sync-dot" title="Sync status"></span>
+        <button class="rate-chip" id="rate-chip" title="Exchange rate">£/د.م</button>
+        <button class="icon-btn" id="coach-btn" title="Ask your coach" aria-label="Coach">✦</button>
+      </div>
     </header>
 
     <div id="screens">
       <!-- Home -->
       <section class="screen" data-screen="home">
-        <div id="checkin-card"></div>
-        <div id="alerts" class="alerts"></div>
-        <div class="net-card">
-          <div class="net-label">NET WORTH · in £</div>
-          <div class="net-value" id="net-value">£0</div>
-          <div class="net-break" id="net-break"></div>
+        <div id="home-banner"></div>
+
+        <div class="hero-card">
+          <div class="hero-label">SAFE TO SPEND · in £</div>
+          <div class="hero-value" id="hero-value">£0</div>
+          <div class="hero-sub" id="hero-sub"></div>
         </div>
 
-        <div class="stat-row">
-          <div class="stat">
-            <div class="stat-label">Spent this month</div>
-            <div class="stat-value" id="stat-spent">£0</div>
-          </div>
-          <div class="stat stat-bad">
-            <div class="stat-label">Wasted this month</div>
-            <div class="stat-value" id="stat-wasted">£0</div>
-          </div>
-        </div>
+        <div class="month-strip" id="month-strip"></div>
 
-        <div id="verdict" class="verdict"></div>
-
-        <div id="trend-card" class="trend-card hidden"></div>
-
-        <div class="section-head"><span>This month by category</span></div>
+        <div class="section-head"><span>Top spending this month</span></div>
         <div id="home-cats" class="cat-list"></div>
 
         <div class="section-head"><span>Recent</span></div>
@@ -88,14 +75,10 @@
         <div id="spend-tx" class="tx-list"></div>
       </section>
 
-      <!-- Save -->
-      <section class="screen hidden" data-screen="save">
+      <!-- Money (Goals + Loans) -->
+      <section class="screen hidden" data-screen="money">
         <div class="section-head"><span>Savings goals</span><button class="mini-btn" id="add-goal">+ Goal</button></div>
         <div id="goal-list" class="goal-list"></div>
-      </section>
-
-      <!-- Loans -->
-      <section class="screen hidden" data-screen="loans">
         <div class="loan-summary" id="loan-summary"></div>
         <div class="section-head"><span>You owe</span><button class="mini-btn" id="add-owe">+ Debt</button></div>
         <div id="owe-list" class="loan-list"></div>
@@ -115,6 +98,7 @@
       <!-- Review -->
       <section class="screen hidden" data-screen="review">
         <div class="review-head" id="review-head"></div>
+        <div id="trend-card" class="trend-card hidden"></div>
         <div id="insights" class="insights"></div>
         <div class="section-head"><span>Judge your week</span></div>
         <div id="review-list" class="tx-list"></div>
@@ -128,9 +112,7 @@
     <nav class="nav">
       <button class="nav-btn active" data-nav="home"><span class="ni">◎</span><span>Home</span></button>
       <button class="nav-btn" data-nav="spend"><span class="ni">▤</span><span>Spend</span></button>
-      <button class="nav-btn" data-nav="save"><span class="ni">◆</span><span>Save</span></button>
-      <button class="nav-btn" data-nav="loans"><span class="ni">⇄</span><span>Loans</span></button>
-      <button class="nav-btn" data-nav="coach"><span class="ni">✦</span><span>Coach</span></button>
+      <button class="nav-btn" data-nav="money"><span class="ni">◆</span><span>Money</span></button>
       <button class="nav-btn" data-nav="review"><span class="ni">⚖</span><span>Review</span></button>
     </nav>
   </main>

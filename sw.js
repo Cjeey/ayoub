@@ -1,5 +1,5 @@
 /* Reckon service worker — offline-first shell cache. */
-const CACHE = 'reckon-v4';
+const CACHE = 'reckon-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -24,8 +24,8 @@ self.addEventListener('fetch', (e) => {
   const { request } = e;
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
-  // Never cache the live FX API — always go to network, fail soft.
-  if (url.hostname.includes('er-api.com')) return;
+  // Never cache external APIs (FX rate, Supabase auth/data/functions, Gemini).
+  if (url.hostname.includes('er-api.com') || url.hostname.includes('supabase.co') || url.hostname.includes('googleapis.com')) return;
   // App shell: cache-first. Everything else: network falling back to cache.
   if (url.origin === location.origin) {
     e.respondWith(caches.match(request).then((hit) => hit || fetch(request)));

@@ -21,7 +21,8 @@ app itself.
   python3 -m http.server 8000
   # visit http://localhost:8000
   ```
-- First launch asks you to **set a 4-digit passcode**.
+- First launch asks you to **sign up with an email and password** (or log in).
+- **Dark and light themes** — toggle in Settings (tap the rate chip → Settings).
 
 ## The four anti-waste nudges
 
@@ -66,33 +67,28 @@ app itself.
 - **Cloud backup** across devices via a secret sync code (no email/login)
 - One-tap JSON **export** for local backup (Settings)
 
-## Cloud backup — how it works
+## Accounts & cloud database
 
-Reckon is private by design, so cloud sync uses **no email or password**.
-When you turn it on, the app generates a long random **sync code** and stores
-your data in a Supabase vault reachable *only* with that code. To use your
-money on another device, install Reckon there and enter the same code.
+Reckon uses **Supabase** as its database with **email/password** login.
+Sign up once, and your money lives in your own row of a Postgres table,
+protected by row-level security — log in on any device to see it.
 
-**The code is the only key to your data — save it, keep it private, and
-don't lose it (there's no reset).**
+Architecture (`supabase/migrations/0002_reckon_user_data.sql`):
 
-Security model (`supabase/migrations/0001_reckon_vault_sync.sql`):
-
-- One `vaults(code, data, updated_at)` table with **RLS on and no policies**,
-  so the public key can't read or write it directly.
-- All access goes through two `SECURITY DEFINER` functions, `vault_pull` /
-  `vault_push`, that require a 16+ char code (the client generates ~118 bits).
-- Sync is last-write-wins by revision timestamp; the app pulls a newer cloud
-  copy on open and pushes local changes shortly after you make them.
-
-Local-only settings (your passcode, the sync code itself) never leave the
-device — only your ledger does.
-
-## Data & storage
-
-Data is stored locally in `localStorage` under `reckon.v1`, behind a small
-storage layer (`load` / `save`) with a `Cloud` module layered on top. With
-cloud backup off, everything stays on the device.
+- One `user_data(user_id, data jsonb, updated_at)` row per user, with **RLS
+  scoped to `auth.uid()`** so no one can read or write another user's data.
+- The client (`Auth` + `Cloud` modules in `script.js`) talks to Supabase
+  directly over REST/GoTrue — sign up, log in, and token refresh with no
+  third-party library. Sign-up goes through a `signup` **edge function**
+  (`supabase/functions/signup`) that creates the account pre-confirmed via the
+  admin API, so login works instantly without a confirmation email.
+- **Offline-first:** your data is cached in `localStorage` (keyed per user), so
+  the app opens and works with no network; changes sync up when you're back
+  online. Sync is last-write-wins by a client revision (`_rev`), pushes are
+  serialized so a slow request can't clobber newer data, and a rejected token
+  sends you back to the login screen without losing your cached edits.
+- Your **Google AI key stays on the device only** — it's stripped from both the
+  cloud payload and the JSON export.
 
 ## Files
 

@@ -7,22 +7,23 @@
 'use strict';
 
 /* ------------------------------------------------------------------ *
- * Store — single source of truth. Swap the guts of load/save later   *
- * for Supabase; the rest of the app only talks to `db` + save().     *
+ * Store — single source of truth. Data lives in Supabase (per-user,   *
+ * row-level-secured) with a local cache so the app works offline.     *
+ * The rest of the app only talks to `db` + save().                    *
  * ------------------------------------------------------------------ */
-const KEY = 'reckon.v1';
+const SUPABASE_URL = 'https://sjxixnltjxpygcvxmfrx.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_Pcuq62al1sYYAAW7HzYHSA_xoHcCYe4';
+const SESSION_KEY = 'reckon.session';
+const dataKey = (id) => 'reckon.data.' + id;
 
 const DEFAULTS = () => ({
   settings: {
-    passcode: null,            // set on first run (local device lock only)
     mainCurrency: 'GBP',       // totals shown in £
     tone: 'harsh',
+    theme: 'dark',             // 'dark' | 'light'
     rate: 12.5,                // MAD per 1 GBP (fallback / manual)
     rateLive: true,
     rateFetched: null,
-    cloudOn: false,            // cloud backup enabled
-    syncCode: null,            // secret vault key (local)
-    lastSync: null,            // last successful cloud sync (ms)
     aiKey: null,               // Google AI Studio key (LOCAL ONLY, never synced)
     aiModel: 'gemini-2.5-flash',
   },
@@ -49,133 +50,169 @@ const DEFAULTS = () => ({
   _rev: null,     // ISO string, bumped on every save() — drives cloud last-write-wins
 });
 
-let db = load();
+let session = loadSession();
+let lastUserId = session && session.user ? session.user.id : null;   // survives clearSession
+let db = DEFAULTS();
 
-function load() {
+function loadSession() { try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch (e) { return null; } }
+function saveSession(s) { session = s; lastUserId = s.user.id; try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch (e) {} }
+function clearSession() { session = null; try { localStorage.removeItem(SESSION_KEY); } catch (e) {} }
+
+// Load this user's cached document; migrate legacy single-key data on first login.
+function loadLocalDB() {
+  const base = DEFAULTS();
+  if (!session) return base;
   try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return DEFAULTS();
-    const parsed = JSON.parse(raw);
-    const base = DEFAULTS();
-    return { ...base, ...parsed, settings: { ...base.settings, ...(parsed.settings || {}) } };
-  } catch (e) {
-    console.warn('load failed', e);
-    return DEFAULTS();
-  }
+    const raw = localStorage.getItem(dataKey(session.user.id));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return { ...base, ...parsed, settings: { ...base.settings, ...(parsed.settings || {}) } };
+    }
+    const legacy = localStorage.getItem('reckon.v1');   // pre-auth local data
+    if (legacy) {
+      // consume it once so it can't seed a second account on this device
+      try { localStorage.removeItem('reckon.v1'); } catch (e) {}
+      const p = JSON.parse(legacy);
+      return { ...base, ...p, settings: { ...base.settings, ...(p.settings || {}) } };
+    }
+  } catch (e) { console.warn('loadLocalDB failed', e); }
+  return base;
 }
+
 function save(skipCloud) {
   db._rev = new Date().toISOString();
-  try { localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch (e) { console.warn('save failed', e); }
-  if (!skipCloud && db.settings.cloudOn && db.settings.syncCode) Cloud.pushSoon();
+  // Local cache keyed on the last known user — persists even if the session
+  // token expired in the background, so edits are never silently dropped.
+  if (lastUserId) { try { localStorage.setItem(dataKey(lastUserId), JSON.stringify(db)); } catch (e) {} }
+  if (!skipCloud && session) Cloud.pushSoon();
 }
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 /* ------------------------------------------------------------------ *
- * Cloud — secret-code vault sync via Supabase RPC (no login needed).  *
- * The publishable key is safe to embed; the vault is unreachable      *
- * without the long random syncCode.                                   *
+ * Auth — Supabase email/password (GoTrue). Session cached locally so  *
+ * the app opens offline; tokens auto-refresh before expiry.           *
  * ------------------------------------------------------------------ */
-const SUPABASE_URL = 'https://sjxixnltjxpygcvxmfrx.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_Pcuq62al1sYYAAW7HzYHSA_xoHcCYe4';
+const Auth = {
+  async signup(email, password) {
+    // pre-confirmed account is created by the `signup` edge function
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/signup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      body: JSON.stringify({ email, password }),
+    });
+    if (r.status === 409) throw new Error('exists');
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error === 'weak_password' ? 'weak' : j.error === 'invalid_email' ? 'email' : 'signup');
+    }
+    return this.login(email, password);
+  },
+  async login(email, password) {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY },
+      body: JSON.stringify({ email, password }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error_description || j.msg || j.error || 'login');
+    saveSession({
+      access_token: j.access_token, refresh_token: j.refresh_token,
+      expires_at: Date.now() + (j.expires_in || 3600) * 1000,
+      user: { id: j.user.id, email: j.user.email },
+    });
+  },
+  async refresh() {
+    if (!session) throw new Error('no-session');
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY },
+      body: JSON.stringify({ refresh_token: session.refresh_token }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // token genuinely rejected — surface the login screen instead of silently
+      // running session-less. Local edits are safe (cached under lastUserId).
+      clearSession();
+      try { showAuth(); } catch (e) {}
+      throw new Error('refresh');
+    }
+    saveSession({
+      access_token: j.access_token, refresh_token: j.refresh_token,
+      expires_at: Date.now() + (j.expires_in || 3600) * 1000,
+      user: { id: j.user.id, email: j.user.email },
+    });
+  },
+  async token() {
+    if (!session) throw new Error('no-session');
+    if (Date.now() > session.expires_at - 60000) await this.refresh();
+    return session.access_token;
+  },
+  logout() { clearSession(); },
+};
 
+/* ------------------------------------------------------------------ *
+ * Cloud — sync the document to the user's RLS-protected Supabase row. *
+ * ------------------------------------------------------------------ */
 const Cloud = {
   _timer: null,
-  _busy: false,
+  _inflight: false,
+  _pending: false,
+  headers(token) { return { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }; },
+  payload() { const c = JSON.parse(JSON.stringify(db)); delete c.settings.aiKey; return c; },   // AI key stays local
 
-  makeCode() {
-    const bytes = new Uint8Array(24);
-    (self.crypto || window.crypto).getRandomValues(bytes);
-    const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
-    let s = '';
-    for (const b of bytes) s += abc[b % abc.length];   // 24 chars, ~118 bits
-    return 'rk-' + s.slice(0, 6) + '-' + s.slice(6, 12) + '-' + s.slice(12, 18) + '-' + s.slice(18, 24);
+  async pull() {
+    const token = await Auth.token();
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/user_data?user_id=eq.${session.user.id}&select=data`, { headers: this.headers(token) });
+    if (!r.ok) throw new Error('pull ' + r.status);
+    const rows = await r.json();
+    return (rows[0] && rows[0].data) || null;
   },
-
-  // strip local-only settings before it leaves the device
-  payload() {
-    const copy = JSON.parse(JSON.stringify(db));
-    delete copy.settings.passcode;
-    delete copy.settings.syncCode;
-    delete copy.settings.cloudOn;
-    delete copy.settings.lastSync;
-    delete copy.settings.aiKey;      // AI key never leaves this device
-    return copy;
-  },
-
-  async rpc(fn, body) {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error(`${fn} ${r.status}`);
-    return r.json();
-  },
-
+  // Only one push in flight; a save during a push queues one more, so the very
+  // latest db always wins and a slow/stale request can't clobber newer data.
   async push() {
-    if (!db.settings.cloudOn || !db.settings.syncCode) return;
-    this._busy = true;
+    if (!session) return;
+    if (this._inflight) { this._pending = true; return; }
+    this._inflight = true;
     try {
-      await this.rpc('vault_push', {
-        p_code: db.settings.syncCode,
-        p_data: this.payload(),
-        p_updated_at: db._rev || new Date().toISOString(),
-      });
-      db.settings.lastSync = Date.now();
-      save(true);
-      renderCloudStatus();
-    } catch (e) { console.warn('cloud push failed', e); renderCloudStatus('error'); }
-    finally { this._busy = false; }
+      do {
+        this._pending = false;
+        const token = await Auth.token();
+        const row = { user_id: session.user.id, data: this.payload() };   // re-read latest each loop
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/user_data?on_conflict=user_id`, {
+          method: 'POST',
+          headers: { ...this.headers(token), 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+          body: JSON.stringify(row),
+        });
+        if (!r.ok) throw new Error('push ' + r.status);
+      } while (this._pending);
+      syncState('ok');
+    } catch (e) { console.warn('cloud push failed', e); syncState('error'); }
+    finally { this._inflight = false; }
   },
+  pushSoon() { clearTimeout(this._timer); this._timer = setTimeout(() => this.push(), 1200); },
 
-  pushSoon() {
-    clearTimeout(this._timer);
-    this._timer = setTimeout(() => this.push(), 1500);
-  },
-
-  // pull remote; adopt it if it's newer than local. returns 'pulled'|'pushed'|'same'
+  // pull remote; adopt if its client-rev is newer than local, else push local up
   async sync() {
-    if (!db.settings.syncCode) throw new Error('no code');
-    const rows = await this.rpc('vault_pull', { p_code: db.settings.syncCode });
-    const remote = Array.isArray(rows) ? rows[0] : rows;
+    const remote = await this.pull();
     const localRev = db._rev ? Date.parse(db._rev) : 0;
-    if (remote && remote.data) {
-      const remoteRev = remote.updated_at ? Date.parse(remote.updated_at) : 0;
+    if (remote && Object.keys(remote).length) {
+      const remoteRev = remote._rev ? Date.parse(remote._rev) : 0;
       if (remoteRev > localRev) {
-        const incoming = remote.data;
-        // keep local-only settings, take everything else from cloud
-        const localOnly = {
-          passcode: db.settings.passcode, syncCode: db.settings.syncCode,
-          cloudOn: true, lastSync: Date.now(), aiKey: db.settings.aiKey,
-        };
-        db = { ...DEFAULTS(), ...incoming };
-        db.settings = { ...DEFAULTS().settings, ...(incoming.settings || {}), ...localOnly };
+        const keepAi = db.settings.aiKey;
+        db = { ...DEFAULTS(), ...remote };
+        db.settings = { ...DEFAULTS().settings, ...(remote.settings || {}), aiKey: keepAi };
         save(true);
         return 'pulled';
       }
     }
     await this.push();
-    return remote && remote.data ? 'pushed' : 'pushed';
-  },
-
-  // link this device to an existing code: always adopt the remote copy
-  async link(code) {
-    db.settings.syncCode = code.trim();
-    const rows = await this.rpc('vault_pull', { p_code: db.settings.syncCode });
-    const remote = Array.isArray(rows) ? rows[0] : rows;
-    if (!remote || !remote.data) { db.settings.syncCode = null; throw new Error('No vault found for that code.'); }
-    const localOnly = { passcode: db.settings.passcode, syncCode: db.settings.syncCode, cloudOn: true, lastSync: Date.now(), aiKey: db.settings.aiKey };
-    db = { ...DEFAULTS(), ...remote.data };
-    db.settings = { ...DEFAULTS().settings, ...(remote.data.settings || {}), ...localOnly };
-    save(true);
+    return 'pushed';
   },
 };
+
+// sync status indicator (topbar dot); defined for early calls, real render later
+function syncState(state) { try { const d = document.getElementById('sync-dot'); if (d) d.className = 'sync-dot ' + (state || ''); } catch (e) {} }
 
 /* ------------------------------------------------------------------ *
  * Currency helpers — everything reduces to GBP for the big numbers.  *
@@ -191,7 +228,9 @@ function fmt(amount, cur = 'GBP') {
   const s = abs >= 1000 ? abs.toLocaleString(undefined, { maximumFractionDigits: 0 })
                         : abs.toLocaleString(undefined, { maximumFractionDigits: abs % 1 === 0 ? 0 : 2 });
   const sign = n < 0 ? '−' : '';
-  return cur === 'MAD' ? `${sign}${s} د.م` : `${sign}£${s}`;
+  // Wrap the dirham amount in an LTR isolate (U+2066…U+2069) so its Arabic
+  // glyph can't reorder surrounding Latin text on the same line (bidi bug).
+  return cur === 'MAD' ? `⁦${sign}${s} د.م⁩` : `${sign}£${s}`;
 }
 const fmtGBP = (a) => fmt(a, 'GBP');
 
@@ -248,65 +287,69 @@ function toast(msg) {
 }
 
 /* ==================================================================== *
- *  LOCK SCREEN                                                          *
+ *  AUTH SCREEN — email / password                                      *
  * ==================================================================== */
-let pinBuf = '';
-let pinMode = 'enter';   // 'enter' | 'set' | 'confirm'
-let pinFirst = '';
+let authMode = 'login';   // 'login' | 'signup'
+let authBusy = false;
 
-function startLock() {
-  const first = !db.settings.passcode;
-  pinMode = first ? 'set' : 'enter';
-  pinBuf = ''; pinFirst = '';
-  $('#lock-sub').textContent = first ? 'Create a passcode (4 digits).' : 'Enter your passcode.';
-  $('#lock-sub').classList.remove('err');
-  renderDots();
-  $('#lock').classList.remove('hidden');
+function showAuth() {
+  $('#auth').classList.remove('hidden');
   $('#app').classList.add('hidden');
+  renderAuth();
 }
-function renderDots() {
-  const box = $('#pin-dots'); box.innerHTML = '';
-  for (let i = 0; i < 4; i++) {
-    const d = el('div', 'dot' + (i < pinBuf.length ? ' on' : ''));
-    box.appendChild(d);
-  }
-}
-function pinKey(k) {
-  if (k === 'del') { pinBuf = pinBuf.slice(0, -1); renderDots(); return; }
-  if (k === 'reset') {
-    if (confirm('Reset everything and wipe all data? This cannot be undone.')) {
-      localStorage.removeItem(KEY); db = DEFAULTS(); startLock();
-    }
-    return;
-  }
-  if (pinBuf.length >= 4) return;
-  pinBuf += k; renderDots();
-  if (pinBuf.length === 4) setTimeout(submitPin, 120);
-}
-function submitPin() {
-  if (pinMode === 'set') {
-    pinFirst = pinBuf; pinBuf = ''; pinMode = 'confirm';
-    $('#lock-sub').textContent = 'Confirm it.'; renderDots();
-  } else if (pinMode === 'confirm') {
-    if (pinBuf === pinFirst) {
-      db.settings.passcode = pinBuf; save(); unlock();
-    } else { failPin('Didn\'t match. Start again.'); pinMode = 'set'; pinFirst = ''; }
-  } else {
-    if (pinBuf === db.settings.passcode) unlock();
-    else failPin('Wrong passcode.');
-  }
-}
-function failPin(msg) {
-  pinBuf = '';
-  const sub = $('#lock-sub'); sub.textContent = msg; sub.classList.add('err');
-  $('.lock-box').classList.add('shake');
-  setTimeout(() => $('.lock-box').classList.remove('shake'), 420);
-  renderDots();
-}
-function unlock() {
-  $('#lock').classList.add('hidden');
+function showApp() {
+  $('#auth').classList.add('hidden');
   $('#app').classList.remove('hidden');
-  bootApp();
+}
+function renderAuth() {
+  const signup = authMode === 'signup';
+  $('#auth-title').textContent = signup ? 'Create your account' : 'Welcome back';
+  $('#auth-sub').textContent = signup ? 'Start tracking in 30 seconds.' : 'Log in to your money.';
+  $('#auth-submit').textContent = signup ? 'Create account' : 'Log in';
+  $('#auth-switch').innerHTML = signup
+    ? 'Already have an account? <b>Log in</b>'
+    : 'New here? <b>Create an account</b>';
+  $('#auth-err').textContent = '';
+}
+async function submitAuth() {
+  if (authBusy) return;
+  const email = $('#auth-email').value.trim();
+  const pw = $('#auth-pw').value;
+  const err = $('#auth-err');
+  err.textContent = '';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { err.textContent = 'Enter a valid email.'; return; }
+  if (pw.length < 8) { err.textContent = 'Password needs at least 8 characters.'; return; }
+
+  authBusy = true;
+  const btn = $('#auth-submit'); btn.textContent = '…'; btn.disabled = true;
+  try {
+    if (authMode === 'signup') await Auth.signup(email, pw);
+    else await Auth.login(email, pw);
+    db = loadLocalDB();
+    applyTheme();
+    try { await Cloud.sync(); } catch (e) { console.warn('initial sync failed', e); }
+    showApp();
+    bootApp();
+  } catch (e) {
+    const m = e.message;
+    err.textContent =
+      m === 'exists' ? 'That email already has an account — log in instead.'
+      : m === 'weak' ? 'Password needs at least 8 characters.'
+      : m === 'email' ? 'That email looks invalid.'
+      : /invalid.*credent|invalid login|bad/i.test(m) ? 'Wrong email or password.'
+      : authMode === 'signup' ? 'Could not sign up. Check your connection.'
+      : 'Could not log in. Check your details and connection.';
+    if (m === 'exists') { authMode = 'login'; renderAuth(); $('#auth-err').textContent = 'Account exists — just log in.'; }
+  } finally {
+    authBusy = false; btn.disabled = false;
+    btn.textContent = authMode === 'signup' ? 'Create account' : 'Log in';   // mode-correct
+  }
+}
+function logout() {
+  Auth.logout();
+  db = DEFAULTS();
+  closeSheet();
+  showAuth();
 }
 
 /* ------------------------------------------------------------------ *
@@ -347,7 +390,7 @@ function go(screen) {
   renderScreen(screen);
 }
 function renderScreen(s) {
-  ({ home: renderHome, spend: renderSpend, save: renderSave, loans: renderLoans, review: renderReview, coach: renderCoach }[s] || (() => {}))();
+  ({ home: renderHome, spend: renderSpend, money: renderMoney, review: renderReview, coach: renderCoach }[s] || (() => {}))();
 }
 
 /* ==================================================================== *
@@ -369,59 +412,97 @@ function savedGBP()  { return db.goals.reduce((s, g) => s + toGBP(g.saved, g.cur
 function oweGBP()    { return db.loans.filter(l => l.dir === 'owe'  && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
 function owedGBP()   { return db.loans.filter(l => l.dir === 'owed' && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
 
-function renderAlerts() {
-  const box = $('#alerts'); box.innerHTML = '';
-  const items = [];
-
-  // Loans you owe: overdue, then due soon
-  const owe = db.loans.filter(l => l.dir === 'owe' && !l.settled && l.due);
-  for (const l of owe) {
-    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
-    if (d < 0) items.push({ cls: 'a-bad', ic: '🔴', html: `You're <b>${-d}d overdue</b> paying <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)}. Sort it.`, nav: 'loans' });
-    else if (d <= 3) items.push({ cls: 'a-warn', ic: '⏰', html: `Pay <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)} ${d === 0 ? '<b>today</b>' : `in <b>${d}d</b>`}.`, nav: 'loans' });
-  }
-
-  // Money owed to you, overdue
-  for (const l of db.loans.filter(l => l.dir === 'owed' && !l.settled && l.due)) {
-    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
-    if (d < 0) items.push({ cls: 'a-warn', ic: '📌', html: `<b>${esc(l.who)}</b> is <b>${-d}d late</b> paying you back ${fmt(l.amount, l.cur)}. Chase it.`, nav: 'loans' });
-  }
-
-  // Weekly review nudge
-  const weekAgo = new Date(now() - 7 * 86400000);
-  const pending = db.tx.filter(t => t.kind === 'expense' && t.regret == null && !catById(t.cat).essential && new Date(t.date) >= weekAgo);
-  if (pending.length) items.push({ cls: 'a-warn', ic: '⚖️', html: `<b>${pending.length}</b> purchase${pending.length > 1 ? 's' : ''} from this week need${pending.length > 1 ? '' : 's'} an honest verdict.`, nav: 'review' });
-
-  for (const it of items.slice(0, 4)) {
-    const a = el('div', 'alert ' + it.cls, `<span class="ai">${it.ic}</span><span>${it.html}</span><span class="go">›</span>`);
-    a.addEventListener('click', () => go(it.nav));
-    box.appendChild(a);
-  }
+function daysLeftInMonthHome() {
+  const t = now();
+  return Math.max(1, new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate() - t.getDate() + 1);
 }
 
 function renderHome() {
-  renderCheckinCard();
-  renderAlerts();
-  const net = liquidGBP() + savedGBP() + owedGBP() - oweGBP();
-  const nv = $('#net-value');
-  nv.textContent = fmtGBP(net);
-  nv.classList.toggle('neg', net < 0);
-  $('#net-break').innerHTML =
-    `<span>Cash <b>${fmtGBP(liquidGBP())}</b></span>` +
-    `<span>Saved <b>${fmtGBP(savedGBP())}</b></span>` +
-    `<span>Owed you <b>${fmtGBP(owedGBP())}</b></span>` +
-    `<span>You owe <b>${fmtGBP(oweGBP())}</b></span>`;
+  renderHomeBanner();
 
+  // HERO — safe to spend (cash that's truly yours, after debts)
+  const cash = liquidGBP();
+  const safe = cash - oweGBP();
+  const perDay = safe > 0 ? safe / daysLeftInMonthHome() : 0;
+  const hv = $('#hero-value');
+  animateNumber(hv, safe, (v) => fmtGBP(v));
+  hv.classList.toggle('neg', safe < 0);
+  $('#hero-sub').innerHTML = safe >= 0
+    ? `yours to spend · <b>${fmtGBP(perDay)}</b>/day for the next <b>${daysLeftInMonthHome()}</b> days`
+    : `you owe <b>${fmtGBP(-safe)}</b> more than you have. Careful.`;
+
+  // MONTH STRIP — spent vs budget, wasted inline
   const exp = monthExpenses();
   const spent = exp.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
   const wasted = exp.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
-  $('#stat-spent').textContent = fmtGBP(spent);
-  $('#stat-wasted').textContent = fmtGBP(wasted);
+  const budget = db.categories.reduce((s, c) => s + (c.limit || 0), 0);
+  const pct = budget > 0 ? Math.min(100, spent / budget * 100) : 0;
+  const over = budget > 0 && spent > budget;
+  $('#month-strip').innerHTML = `
+    <div class="ms-top">
+      <span>Spent this month</span>
+      <span class="ms-amt"><b>${fmtGBP(spent)}</b>${budget ? ' / ' + fmtGBP(budget) : ''}</span>
+    </div>
+    <div class="bar ${over ? 'over' : pct >= 80 ? 'near' : ''}"><span style="width:${budget ? pct : 0}%"></span></div>
+    <div class="ms-sub">${wasted > 0
+      ? `<span class="ms-waste">${fmtGBP(wasted)} of it wasted</span> · net worth ${fmtGBP(cash + savedGBP() + owedGBP() - oweGBP())}`
+      : `Nothing wasted yet · net worth ${fmtGBP(cash + savedGBP() + owedGBP() - oweGBP())}`}</div>`;
 
-  renderVerdict(spent, wasted, exp);
-  renderTrend();
   renderHomeCats(exp);
   renderRecent();
+}
+
+// One banner, most important first: check-in → overdue debt → overspend → review nudge
+function renderHomeBanner() {
+  const box = $('#home-banner'); box.innerHTML = '';
+  const p = pendingCheckin();
+  if (p) {
+    const copy = {
+      morning: ['☀️', '<b>Morning check-in.</b> Set the tone before the day spends you.', () => openCheckin('morning')],
+      evening: ['🌙', '<b>Evening check-in.</b> Did you keep your word today?', () => openCheckin('evening')],
+      weekly:  ['🧾', '<b>Sunday reckoning.</b> Time to face your week.', () => openCheckin('weekly')],
+    }[p];
+    const c = el('div', 'banner accent', `<span class="bi">${copy[0]}</span><span>${copy[1]}</span><span class="go">›</span>`);
+    c.addEventListener('click', copy[2]); box.appendChild(c); return;
+  }
+  // else: the single most urgent alert
+  const a = topAlert();
+  if (a) {
+    const c = el('div', 'banner ' + a.cls, `<span class="bi">${a.ic}</span><span>${a.html}</span><span class="go">›</span>`);
+    c.addEventListener('click', () => go(a.nav)); box.appendChild(c);
+  }
+}
+function topAlert() {
+  const items = [];
+  for (const l of db.loans.filter(l => l.dir === 'owe' && !l.settled && l.due)) {
+    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
+    if (d < 0) items.push({ pri: 0, cls: 'bad', ic: '🔴', html: `You're <b>${-d}d overdue</b> paying <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)}.`, nav: 'money' });
+    else if (d <= 3) items.push({ pri: 2, cls: 'warn', ic: '⏰', html: `Pay <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)} ${d === 0 ? '<b>today</b>' : `in <b>${d}d</b>`}.`, nav: 'money' });
+  }
+  const exp = monthExpenses();
+  const wasted = exp.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const spent = exp.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  if (wasted > 0 && wasted >= spent * 0.25) items.push({ pri: 1, cls: 'bad', ic: '🩸', html: `<b>${fmtGBP(wasted)}</b> wasted this month — ${Math.round(wasted / spent * 100)}% of everything you spent. Cut it.`, nav: 'review' });
+  const weekAgo = new Date(now() - 7 * 86400000);
+  const pending = db.tx.filter(t => t.kind === 'expense' && t.regret == null && !catById(t.cat).essential && new Date(t.date) >= weekAgo);
+  if (pending.length) items.push({ pri: 3, cls: 'warn', ic: '⚖️', html: `<b>${pending.length}</b> purchase${pending.length > 1 ? 's' : ''} need${pending.length > 1 ? '' : 's'} an honest verdict.`, nav: 'review' });
+  items.sort((a, b) => a.pri - b.pri);
+  return items[0] || null;
+}
+
+// count-up animation for the hero figure
+function animateNumber(node, target, fmtFn) {
+  const start = parseFloat(node.dataset.val || '0') || 0;
+  if (start === target) { node.textContent = fmtFn(target); return; }
+  const t0 = performance.now(), dur = 500;
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / dur);
+    const e = 1 - Math.pow(1 - k, 3);
+    node.textContent = fmtFn(start + (target - start) * e);
+    if (k < 1) requestAnimationFrame(step); else node.dataset.val = target;
+  };
+  node.dataset.val = target;
+  requestAnimationFrame(step);
 }
 
 /* 6-month spending trend, splitting wasted (red) from the rest. */
@@ -462,58 +543,43 @@ function renderTrend() {
     `<div class="trend-head">
        <span class="trend-title">Last 6 months</span>
        <span class="trend-legend">
-         <i><span class="sw" style="background:#3a4a6b"></span>spent</i>
-         <i><span class="sw" style="background:var(--bad)"></span>wasted</i>
+         <i><span class="sw" style="background:var(--chart-spent)"></span>spent</i>
+         <i><span class="sw" style="background:var(--waste)"></span>wasted</i>
        </span>
      </div>
      <div class="trend-bars">${bars}</div>`;
-}
-
-function renderVerdict(spent, wasted, exp) {
-  const v = $('#verdict');
-  const unflagged = exp.filter(t => t.regret == null && !catById(t.cat).essential).length;
-  let cls = 'v-good', msg;
-
-  if (wasted > 0 && wasted >= spent * 0.25) {
-    cls = 'v-bad';
-    msg = `You've thrown <b>${fmtGBP(wasted)}</b> at stupid stuff this month — that's <b>${Math.round(wasted / spent * 100)}%</b> of everything you spent. Cut it out.`;
-  } else if (wasted > 0) {
-    cls = 'v-warn';
-    msg = `<b>${fmtGBP(wasted)}</b> already wasted this month. Small leaks sink ships. Log the next one and think twice.`;
-  } else if (overCats(exp).length) {
-    cls = 'v-warn';
-    const c = overCats(exp)[0];
-    msg = `You've blown past your <b>${esc(c.name)}</b> limit. Ease off before the month's out.`;
-  } else if (exp.length === 0) {
-    cls = 'v-good';
-    msg = `Clean slate this month. Keep it boring — boring is how you save.`;
-  } else if (unflagged > 0) {
-    cls = 'v-warn';
-    msg = `${unflagged} non-essential buy${unflagged > 1 ? 's' : ''} unflagged. Head to <b>Review</b> and be honest with yourself.`;
-  } else {
-    cls = 'v-good';
-    msg = `Nothing wasted so far. This is what discipline looks like — don't get comfortable.`;
-  }
-  v.className = 'verdict ' + cls;
-  v.innerHTML = msg;
-}
-
-function overCats(exp) {
-  const spentBy = {};
-  for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
-  return db.categories.filter(c => c.limit > 0 && (spentBy[c.id] || 0) > c.limit);
 }
 
 function renderHomeCats(exp) {
   const box = $('#home-cats'); box.innerHTML = '';
   const spentBy = {};
   for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
+  // top 3 by how close to (or over) the limit, else by spend
   const cats = db.categories
     .map(c => ({ c, spent: spentBy[c.id] || 0 }))
-    .filter(x => x.spent > 0 || x.c.limit > 0)
-    .sort((a, b) => b.spent - a.spent);
-  if (!cats.length) { box.appendChild(el('div', 'empty', 'No spending yet this month.')); return; }
-  for (const { c, spent } of cats) box.appendChild(catRow(c, spent, false));
+    .filter(x => x.spent > 0)
+    .sort((a, b) => {
+      const ra = a.c.limit ? a.spent / a.c.limit : 0, rb = b.c.limit ? b.spent / b.c.limit : 0;
+      return (rb - ra) || (b.spent - a.spent);
+    })
+    .slice(0, 3);
+  if (!cats.length) {
+    box.appendChild(emptyState('🍃', 'Nothing spent yet this month', 'Tap ＋ to log your first expense.'));
+    return;
+  }
+  for (const { c, spent } of cats) box.appendChild(catRow(c, spent, true));
+  box.appendChild(seeAll('See all categories', () => go('spend')));
+}
+function emptyState(icon, title, sub, cta, onCta) {
+  const e = el('div', 'empty-state');
+  e.innerHTML = `<div class="es-ic">${icon}</div><div class="es-title">${esc(title)}</div>${sub ? `<div class="es-sub">${esc(sub)}</div>` : ''}`;
+  if (cta) { const b = el('button', 'mini-btn', esc(cta)); b.onclick = onCta; e.appendChild(b); }
+  return e;
+}
+function seeAll(label, fn) {
+  const d = el('div', 'see-all');
+  const b = el('button', null, esc(label) + ' ›');
+  b.onclick = fn; d.appendChild(b); return d;
 }
 
 function catRow(c, spent, tappable) {
@@ -534,9 +600,10 @@ function catRow(c, spent, tappable) {
 
 function renderRecent() {
   const box = $('#home-recent'); box.innerHTML = '';
-  const recent = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 6);
-  if (!recent.length) { box.appendChild(el('div', 'empty', 'Nothing logged yet. Tap ＋ to start.')); return; }
+  const recent = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 4);
+  if (!recent.length) { box.appendChild(emptyState('📝', 'Nothing logged yet', 'Your recent activity shows up here.')); return; }
   for (const t of recent) box.appendChild(txRow(t));
+  if (db.tx.length > 4) box.appendChild(seeAll('See all transactions', () => go('spend')));
 }
 
 function txRow(t) {
@@ -639,6 +706,12 @@ function openRecur(r) {
 /* ==================================================================== *
  *  SAVE (goals)                                                        *
  * ==================================================================== */
+// Money tab = Goals + Loans combined
+function renderMoney() {
+  renderSave();
+  renderLoans();
+}
+
 function renderSave() {
   const box = $('#goal-list'); box.innerHTML = '';
   if (!db.goals.length) {
@@ -713,6 +786,7 @@ function loanCard(l) {
  *  REVIEW (weekly regret)                                               *
  * ==================================================================== */
 function renderReview() {
+  renderTrend();
   const weekAgo = new Date(now() - 7 * 86400000);
   const recent = db.tx.filter(t => t.kind === 'expense' && new Date(t.date) >= weekAgo)
                       .sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -1143,63 +1217,62 @@ function openRate() {
 }
 function openSettings() {
   const s = db.settings;
-  const cloud = s.cloudOn
-    ? `<div class="cloud-box on">
-         <div class="cloud-row"><b>☁︎ Cloud backup is ON</b><span class="cloud-dot" id="cloud-dot"></span></div>
-         <div class="cloud-status" id="cloud-status">${s.lastSync ? 'Last synced ' + relTime(s.lastSync) : 'Not synced yet'}</div>
-         <button class="btn-ghost" id="st-code">Show my sync code</button>
-         <button class="btn-ghost" id="st-syncnow">Sync now</button>
-         <button class="btn-ghost del" id="st-cloudoff">Turn off cloud backup</button>
-       </div>`
-    : `<div class="cloud-box">
-         <div class="cloud-row"><b>☁︎ Cloud backup is OFF</b></div>
-         <div class="cloud-status">Your data lives only on this phone. Turn on backup to survive phone loss and sync across devices — no email needed.</div>
-         <button class="btn-primary" id="st-cloudon">Turn on cloud backup</button>
-         <button class="btn-ghost" id="st-link">I already have a sync code</button>
-       </div>`;
+  const email = session ? session.user.email : '—';
   const body = openSheet(`
     <h2>Settings</h2>
-    <p class="sub">Reckon · your money, honestly.</p>
-    ${cloud}
-    <div class="cloud-box">
-      <div class="cloud-row"><b>✦ AI coach ${db.settings.aiKey ? 'is connected' : 'not set up'}</b></div>
-      <div class="cloud-status">${db.settings.aiKey ? 'Runs on your Google AI key, stored only on this device. Model: ' + esc(db.settings.aiModel || 'gemini-2.5-flash') : 'Connect a Google AI Studio key in the Coach tab to chat with your money.'}</div>
-      ${db.settings.aiKey ? '<button class="btn-ghost" id="st-aikey">Change API key</button><button class="btn-ghost del" id="st-aioff">Disconnect AI</button>' : ''}
+    <div class="set-card">
+      <div class="set-row"><span>Signed in as</span><b>${esc(email)}</b></div>
+      <div class="set-sub">Your money syncs securely to your account — log in on any device to see it.</div>
+      <button class="btn-ghost del" id="st-logout">Log out</button>
     </div>
-    <button class="btn-ghost" id="st-pin">Change passcode</button>
+    <div class="set-card">
+      <div class="set-row"><span>Appearance</span></div>
+      <div class="seg" style="margin-top:10px">
+        <button data-theme="dark" class="${s.theme !== 'light' ? 'on' : ''}">🌙 Dark</button>
+        <button data-theme="light" class="${s.theme === 'light' ? 'on' : ''}">☀️ Light</button>
+      </div>
+    </div>
+    <div class="set-card">
+      <div class="set-row"><span>✦ AI coach</span><b>${s.aiKey ? 'Connected' : 'Off'}</b></div>
+      <div class="set-sub">${s.aiKey ? 'Runs on your Google AI key, stored on this device only.' : 'Connect a Google AI key in the Coach tab to chat with your money.'}</div>
+      ${s.aiKey ? '<button class="btn-ghost" id="st-aikey">Change API key</button><button class="btn-ghost del" id="st-aioff">Disconnect AI</button>' : ''}
+    </div>
     <button class="btn-ghost" id="st-export">Export my data (JSON)</button>
-    <button class="btn-ghost" id="st-import">Import data (restore backup)</button>
-    <button class="btn-ghost del" id="st-wipe">Wipe everything</button>
+    <button class="btn-ghost" id="st-import">Import data</button>
+    <button class="btn-ghost del" id="st-wipe">Wipe all my data</button>
   `);
+  body.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => {
+    db.settings.theme = b.dataset.theme; save(); applyTheme();
+    body.querySelectorAll('[data-theme]').forEach(x => x.classList.toggle('on', x === b));
+  });
+  $('#st-logout').onclick = () => { if (confirm('Log out on this device? Your data stays safe in your account.')) logout(); };
   $('#st-import').onclick = openImport;
   const aik = $('#st-aikey'); if (aik) aik.onclick = () => {
     const k = (prompt('Paste your new Google AI Studio key:') || '').trim();
-    if (!k) return;                                   // backed out — old key untouched
+    if (!k) return;
     if (k.length < 20) { toast('That doesn\'t look like a key.'); return; }
     db.settings.aiKey = k; save(true); toast('AI key updated.');
   };
   const aio = $('#st-aioff'); if (aio) aio.onclick = () => { db.settings.aiKey = null; save(true); closeSheet(); toast('AI disconnected.'); };
-  $('#st-pin').onclick = () => { db.settings.passcode = null; save(); closeSheet(); startLock(); };
   $('#st-export').onclick = () => {
-    // never let secrets ride along in a shareable file
     const copy = JSON.parse(JSON.stringify(db));
-    delete copy.settings.passcode; delete copy.settings.syncCode; delete copy.settings.aiKey;
+    delete copy.settings.aiKey;   // never share the API key
     const blob = new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-    a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded (passcode, sync code & AI key excluded).');
+    a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded (AI key excluded).');
   };
-  $('#st-wipe').onclick = () => { if (confirm('Wipe ALL data permanently? If cloud backup is on, your cloud copy stays under its code.')) { localStorage.removeItem(KEY); db = DEFAULTS(); closeSheet(); startLock(); } };
-  const on = $('#st-cloudon'); if (on) on.onclick = cloudTurnOn;
-  const link = $('#st-link'); if (link) link.onclick = cloudLinkSheet;
-  const code = $('#st-code'); if (code) code.onclick = () => showCode();
-  const syncnow = $('#st-syncnow'); if (syncnow) syncnow.onclick = async () => { toast('Syncing…'); try { const r = await Cloud.sync(); toast(r === 'pulled' ? 'Pulled newer data from cloud.' : 'Synced.'); renderScreen(currentScreen); openSettings(); } catch (e) { toast('Sync failed. Check connection.'); } };
-  const off = $('#st-cloudoff'); if (off) off.onclick = () => { if (confirm('Turn off cloud backup on this device? Your cloud copy stays under its code; this device just stops syncing.')) { db.settings.cloudOn = false; save(true); closeSheet(); toast('Cloud backup off.'); } };
+  $('#st-wipe').onclick = () => {
+    if (!confirm('Wipe ALL your data — transactions, goals, loans — from this account everywhere? This cannot be undone.')) return;
+    const keepAi = db.settings.aiKey, keepTheme = db.settings.theme;
+    db = DEFAULTS(); db.settings.aiKey = keepAi; db.settings.theme = keepTheme;
+    save(); closeSheet(); go('home'); toast('Wiped clean.');
+  };
 }
 
 function openImport() {
   const body = openSheet(`
     <h2>Import data</h2>
-    <p class="sub">Paste a Reckon backup (JSON) or a starter file below. This merges in categories, transactions, goals, loans and recurring items. Your passcode and sync code stay as they are.</p>
+    <p class="sub">Paste a Reckon backup (JSON) or a starter file below. This merges in categories, transactions, goals, loans and recurring items. Your login and AI key are untouched.</p>
     <div class="field"><label>Backup JSON</label><textarea id="imp-txt" rows="7" placeholder='{ "goals": [...], "loans": [...] }' style="width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;color:var(--text);font-family:ui-monospace,monospace;font-size:13px;resize:vertical"></textarea></div>
     <div class="field"><label>Or upload a file</label><input id="imp-file" type="file" accept="application/json,.json" /></div>
     <div class="seg" style="margin-bottom:14px">
@@ -1226,9 +1299,9 @@ function openImport() {
 function importData(data, mode) {
   const arrays = ['tx', 'goals', 'loans', 'recurring', 'categories'];
   if (mode === 'replace') {
-    const keepPin = db.settings.passcode, keepCode = db.settings.syncCode, keepCloud = db.settings.cloudOn, keepAi = db.settings.aiKey;
+    const keepAi = db.settings.aiKey, keepTheme = db.settings.theme;
     db = { ...DEFAULTS(), ...data };
-    db.settings = { ...DEFAULTS().settings, ...(data.settings || {}), passcode: keepPin, syncCode: keepCode, cloudOn: keepCloud, aiKey: keepAi };
+    db.settings = { ...DEFAULTS().settings, ...(data.settings || {}), aiKey: keepAi, theme: keepTheme };
   } else {
     // merge: append arrays (skip exact id dupes), take scalar settings we care about
     for (const k of arrays) {
@@ -1243,57 +1316,6 @@ function importData(data, mode) {
     if (data.settings && typeof data.settings.rate === 'number') db.settings.rate = data.settings.rate;
   }
   save();
-}
-
-function relTime(ms) {
-  const s = Math.round((Date.now() - ms) / 1000);
-  if (s < 60) return 'just now';
-  if (s < 3600) return Math.floor(s / 60) + 'm ago';
-  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  return Math.floor(s / 86400) + 'd ago';
-}
-function renderCloudStatus(state) {
-  const st = $('#cloud-status'); if (st) st.textContent = state === 'error' ? 'Last sync failed — will retry.' : (db.settings.lastSync ? 'Last synced ' + relTime(db.settings.lastSync) : 'Not synced yet');
-}
-
-async function cloudTurnOn() {
-  const code = Cloud.makeCode();
-  db.settings.syncCode = code; db.settings.cloudOn = true;
-  save(true);
-  try { await Cloud.push(); } catch (e) {}
-  showCode(true);
-}
-function showCode(firstTime) {
-  const code = db.settings.syncCode;
-  openSheet(`
-    <h2>${firstTime ? 'Cloud backup is on 🎉' : 'Your sync code'}</h2>
-    <p class="sub">This code <b>is</b> the key to your data. To open your money on another phone, install Reckon there and enter this exact code. Anyone with it can see your data — keep it private, and don't lose it (there's no email reset).</p>
-    <div class="code-box" id="code-box">${esc(code)}</div>
-    <button class="btn-primary" id="cp-copy">Copy code</button>
-    <button class="btn-ghost" data-close>Done</button>
-  `);
-  $('#cp-copy').onclick = async () => {
-    try { await navigator.clipboard.writeText(code); toast('Copied. Store it somewhere safe.'); }
-    catch (e) { toast('Select the code and copy it manually.'); }
-  };
-}
-function cloudLinkSheet() {
-  const body = openSheet(`
-    <h2>Link this device</h2>
-    <p class="sub">Enter the sync code from your other phone to pull your data here. This replaces whatever's on this device.</p>
-    <div class="field"><label>Sync code</label><input id="lk-code" type="text" placeholder="rk-xxxxxx-xxxxxx-…" autocapitalize="off" autocomplete="off" /></div>
-    <button class="btn-primary" id="lk-go">Pull my data</button>
-    <button class="btn-ghost" data-close>Cancel</button>
-  `);
-  $('#lk-go').onclick = async () => {
-    const c = $('#lk-code').value.trim();
-    if (c.length < 16) { toast('That code looks too short.'); return; }
-    if (db.tx.length && !confirm('This will replace the data currently on this device with the cloud copy. Continue?')) return;
-    toast('Linking…');
-    try { await Cloud.link(c); closeSheet(); toast('Linked. Your data is here.'); bootApp(); }
-    catch (e) { toast(e.message || 'Could not link. Check the code.'); }
-  };
-  setTimeout(() => $('#lk-code') && $('#lk-code').focus(), 150);
 }
 
 /* ==================================================================== *
@@ -1586,18 +1608,9 @@ function pendingCheckin() {
   if (h >= 18 && ck.lastEvening !== dayKeyOf(t)) return 'evening';
   return null;
 }
+// check-ins now surface in the single Home banner
 function renderCheckinCard() {
-  const box = $('#checkin-card'); box.innerHTML = '';
-  const p = pendingCheckin();
-  if (!p) return;
-  const copy = {
-    morning: ['☀️', '<b>Morning check-in.</b> Set the tone before the day spends you.'],
-    evening: ['🌙', '<b>Evening check-in.</b> Anything you forgot to log? Did you keep your word?'],
-    weekly:  ['🧾', '<b>Sunday reckoning.</b> Sit down. We\'re going through your week.'],
-  }[p];
-  const card = el('div', 'checkin-card', `<span class="ci">${copy[0]}</span><span>${copy[1]}</span><span class="go">›</span>`);
-  card.addEventListener('click', () => openCheckin(p));
-  box.appendChild(card);
+  if (currentScreen === 'home') renderHomeBanner();
 }
 function todayExpenses() {
   const k = dayKeyOf(now());
@@ -1684,14 +1697,17 @@ function openCheckin(type) {
  *  WIRING                                                               *
  * ==================================================================== */
 function bindOnce() {
-  // lock keypad
-  $$('.key').forEach(k => k.onclick = () => pinKey(k.dataset.k));
+  // auth screen
+  $('#auth-submit').onclick = submitAuth;
+  $('#auth-switch').onclick = () => { authMode = authMode === 'login' ? 'signup' : 'login'; renderAuth(); };
+  $('#auth-pw').addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth(); });
   // nav
   $$('.nav-btn').forEach(b => b.onclick = () => go(b.dataset.nav));
   // fab
   $('#fab').onclick = openAdd;
-  // rate chip
+  // topbar actions
   $('#rate-chip').onclick = openRate;
+  $('#coach-btn').onclick = () => go('coach');
   // coach chat
   $('#chat-send').onclick = sendChat;
   $('#chat-in').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
@@ -1708,11 +1724,15 @@ function bindOnce() {
   });
 }
 
+function applyTheme() {
+  const t = (db.settings && db.settings.theme) || 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', t === 'light' ? '#f3f5f9' : '#0b0d12');
+}
+
 async function bootApp() {
-  // Cloud first: adopt a newer remote copy before we render or post recurring.
-  if (db.settings.cloudOn && db.settings.syncCode) {
-    try { await Cloud.sync(); } catch (e) { console.warn('boot sync failed', e); }
-  }
+  applyTheme();
   postRecurring();
 
   const h = now().getHours();
@@ -1724,14 +1744,18 @@ async function bootApp() {
   go('home');
   refreshRate(false);
 
+  // background: pull any newer copy from another device, then re-render
+  Cloud.sync().then(r => { if (r === 'pulled') { applyTheme(); if (currentScreen) renderScreen(currentScreen); } }).catch(e => console.warn('bg sync', e));
+
   // The app opens the conversation: surface today's check-in once per slot.
   const pending = pendingCheckin();
-  if (pending) setTimeout(() => { if (!$('#sheet').classList.contains('hidden')) return; openCheckin(pending); }, 600);
+  if (pending) setTimeout(() => { if (!$('#sheet').classList.contains('hidden')) return; openCheckin(pending); }, 700);
 }
 
 /* start */
 bindOnce();
-startLock();
+if (session) { db = loadLocalDB(); applyTheme(); showApp(); bootApp(); }
+else { applyTheme(); showAuth(); }
 
 /* PWA service worker */
 if ('serviceWorker' in navigator) {
