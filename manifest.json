@@ -1,0 +1,13 @@
+{
+  "name": "Reckon — money, honestly",
+  "short_name": "Reckon",
+  "description": "A blunt personal money tracker: save, kill stupid spending, settle loans.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d0f14",
+  "theme_color": "#0d0f14",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

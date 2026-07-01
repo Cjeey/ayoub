@@ -1,0 +1,849 @@
+/* =====================================================================
+   Reckon — money, honestly.  Phone-first, harsh-accountability ledger.
+   Storage: localStorage now, structured so a cloud (Supabase) sync
+   drops into the `Store` layer without touching the UI.
+   ===================================================================== */
+
+'use strict';
+
+/* ------------------------------------------------------------------ *
+ * Store — single source of truth. Swap the guts of load/save later   *
+ * for Supabase; the rest of the app only talks to `db` + save().     *
+ * ------------------------------------------------------------------ */
+const KEY = 'reckon.v1';
+
+const DEFAULTS = () => ({
+  settings: {
+    passcode: null,            // set on first run
+    mainCurrency: 'GBP',       // totals shown in £
+    tone: 'harsh',
+    rate: 12.5,                // MAD per 1 GBP (fallback / manual)
+    rateLive: true,
+    rateFetched: null,
+  },
+  categories: [
+    { id: 'food',   name: 'Food & groceries', emoji: '🛒', limit: 250, essential: true },
+    { id: 'trans',  name: 'Transport',        emoji: '🚌', limit: 80,  essential: true },
+    { id: 'eat',    name: 'Eating out',       emoji: '🍔', limit: 60,  essential: false },
+    { id: 'fun',    name: 'Shopping & fun',   emoji: '🛍️', limit: 50,  essential: false },
+    { id: 'bills',  name: 'Bills',            emoji: '🧾', limit: 200, essential: true },
+    { id: 'other',  name: 'Other',            emoji: '•',  limit: 0,   essential: false },
+  ],
+  tx: [],       // { id, kind:'expense'|'income', amount, cur:'GBP'|'MAD', cat, note, regret:null|'stupid'|'worth', date }
+  goals: [],    // { id, name, target, cur, saved }
+  loans: [],    // { id, dir:'owe'|'owed', who, amount, cur, due, settled:false }
+});
+
+let db = load();
+
+function load() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return DEFAULTS();
+    const parsed = JSON.parse(raw);
+    const base = DEFAULTS();
+    return { ...base, ...parsed, settings: { ...base.settings, ...(parsed.settings || {}) } };
+  } catch (e) {
+    console.warn('load failed', e);
+    return DEFAULTS();
+  }
+}
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(db)); }
+  catch (e) { console.warn('save failed', e); }
+  // TODO(cloud): mirror to Supabase here (upsert per-collection) when wired.
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+/* ------------------------------------------------------------------ *
+ * Currency helpers — everything reduces to GBP for the big numbers.  *
+ * ------------------------------------------------------------------ */
+function toGBP(amount, cur) {
+  if (cur === 'GBP') return amount;
+  const rate = db.settings.rate || 12.5;   // MAD per GBP
+  return amount / rate;
+}
+function fmt(amount, cur = 'GBP') {
+  const n = Math.round(amount * 100) / 100;
+  const abs = Math.abs(n);
+  const s = abs >= 1000 ? abs.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                        : abs.toLocaleString(undefined, { maximumFractionDigits: abs % 1 === 0 ? 0 : 2 });
+  const sign = n < 0 ? '−' : '';
+  return cur === 'MAD' ? `${sign}${s} د.م` : `${sign}£${s}`;
+}
+const fmtGBP = (a) => fmt(a, 'GBP');
+
+/* live FX: free, no-key. MAD per GBP. Cached ~6h. Manual fallback. */
+async function refreshRate(force) {
+  if (!db.settings.rateLive) return;
+  const last = db.settings.rateFetched || 0;
+  if (!force && Date.now() - last < 6 * 3600 * 1000) return;
+  try {
+    const r = await fetch('https://open.er-api.com/v6/latest/GBP');
+    const j = await r.json();
+    if (j && j.rates && j.rates.MAD) {
+      db.settings.rate = Math.round(j.rates.MAD * 100) / 100;
+      db.settings.rateFetched = Date.now();
+      save();
+      renderRateChip();
+      if (currentScreen === 'home') renderHome();
+    }
+  } catch (e) { /* offline — keep last/manual rate */ }
+}
+
+/* ------------------------------------------------------------------ *
+ * Date helpers                                                        *
+ * ------------------------------------------------------------------ */
+const now = () => new Date();
+const monthKey = (d) => `${d.getFullYear()}-${d.getMonth()}`;
+const thisMonth = () => monthKey(now());
+const isThisMonth = (iso) => monthKey(new Date(iso)) === thisMonth();
+function daysBetween(a, b) { return Math.round((a - b) / 86400000); }
+function relDate(iso) {
+  const d = new Date(iso), t = now();
+  const diff = daysBetween(new Date(t.toDateString()), new Date(d.toDateString()));
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  if (diff < 7) return `${diff}d ago`;
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+/* ------------------------------------------------------------------ *
+ * DOM helpers                                                         *
+ * ------------------------------------------------------------------ */
+const $  = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const catById = (id) => db.categories.find(c => c.id === id) || { name: 'Other', emoji: '•', essential: false };
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg; t.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), 2200);
+}
+
+/* ==================================================================== *
+ *  LOCK SCREEN                                                          *
+ * ==================================================================== */
+let pinBuf = '';
+let pinMode = 'enter';   // 'enter' | 'set' | 'confirm'
+let pinFirst = '';
+
+function startLock() {
+  const first = !db.settings.passcode;
+  pinMode = first ? 'set' : 'enter';
+  pinBuf = ''; pinFirst = '';
+  $('#lock-sub').textContent = first ? 'Create a passcode (4 digits).' : 'Enter your passcode.';
+  $('#lock-sub').classList.remove('err');
+  renderDots();
+  $('#lock').classList.remove('hidden');
+  $('#app').classList.add('hidden');
+}
+function renderDots() {
+  const box = $('#pin-dots'); box.innerHTML = '';
+  for (let i = 0; i < 4; i++) {
+    const d = el('div', 'dot' + (i < pinBuf.length ? ' on' : ''));
+    box.appendChild(d);
+  }
+}
+function pinKey(k) {
+  if (k === 'del') { pinBuf = pinBuf.slice(0, -1); renderDots(); return; }
+  if (k === 'reset') {
+    if (confirm('Reset everything and wipe all data? This cannot be undone.')) {
+      localStorage.removeItem(KEY); db = DEFAULTS(); startLock();
+    }
+    return;
+  }
+  if (pinBuf.length >= 4) return;
+  pinBuf += k; renderDots();
+  if (pinBuf.length === 4) setTimeout(submitPin, 120);
+}
+function submitPin() {
+  if (pinMode === 'set') {
+    pinFirst = pinBuf; pinBuf = ''; pinMode = 'confirm';
+    $('#lock-sub').textContent = 'Confirm it.'; renderDots();
+  } else if (pinMode === 'confirm') {
+    if (pinBuf === pinFirst) {
+      db.settings.passcode = pinBuf; save(); unlock();
+    } else { failPin('Didn\'t match. Start again.'); pinMode = 'set'; pinFirst = ''; }
+  } else {
+    if (pinBuf === db.settings.passcode) unlock();
+    else failPin('Wrong passcode.');
+  }
+}
+function failPin(msg) {
+  pinBuf = '';
+  const sub = $('#lock-sub'); sub.textContent = msg; sub.classList.add('err');
+  $('.lock-box').classList.add('shake');
+  setTimeout(() => $('.lock-box').classList.remove('shake'), 420);
+  renderDots();
+}
+function unlock() {
+  $('#lock').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  bootApp();
+}
+
+/* ==================================================================== *
+ *  NAVIGATION                                                          *
+ * ==================================================================== */
+let currentScreen = 'home';
+function go(screen) {
+  currentScreen = screen;
+  $$('.screen').forEach(s => s.classList.toggle('hidden', s.dataset.screen !== screen));
+  $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === screen));
+  window.scrollTo(0, 0);
+  renderScreen(screen);
+}
+function renderScreen(s) {
+  ({ home: renderHome, spend: renderSpend, save: renderSave, loans: renderLoans, review: renderReview }[s] || (() => {}))();
+}
+
+/* ==================================================================== *
+ *  HOME                                                                *
+ * ==================================================================== */
+function monthExpenses() { return db.tx.filter(t => t.kind === 'expense' && isThisMonth(t.date)); }
+function monthIncome() { return db.tx.filter(t => t.kind === 'income' && isThisMonth(t.date)); }
+
+function liquidGBP() {
+  // running balance from all income - all expenses, converted to GBP
+  let bal = 0;
+  for (const t of db.tx) {
+    const g = toGBP(t.amount, t.cur);
+    bal += t.kind === 'income' ? g : -g;
+  }
+  return bal;
+}
+function savedGBP()  { return db.goals.reduce((s, g) => s + toGBP(g.saved, g.cur), 0); }
+function oweGBP()    { return db.loans.filter(l => l.dir === 'owe'  && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
+function owedGBP()   { return db.loans.filter(l => l.dir === 'owed' && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
+
+function renderHome() {
+  const net = liquidGBP() + savedGBP() + owedGBP() - oweGBP();
+  const nv = $('#net-value');
+  nv.textContent = fmtGBP(net);
+  nv.classList.toggle('neg', net < 0);
+  $('#net-break').innerHTML =
+    `<span>Cash <b>${fmtGBP(liquidGBP())}</b></span>` +
+    `<span>Saved <b>${fmtGBP(savedGBP())}</b></span>` +
+    `<span>Owed you <b>${fmtGBP(owedGBP())}</b></span>` +
+    `<span>You owe <b>${fmtGBP(oweGBP())}</b></span>`;
+
+  const exp = monthExpenses();
+  const spent = exp.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const wasted = exp.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  $('#stat-spent').textContent = fmtGBP(spent);
+  $('#stat-wasted').textContent = fmtGBP(wasted);
+
+  renderVerdict(spent, wasted, exp);
+  renderHomeCats(exp);
+  renderRecent();
+}
+
+function renderVerdict(spent, wasted, exp) {
+  const v = $('#verdict');
+  const unflagged = exp.filter(t => t.regret == null && !catById(t.cat).essential).length;
+  let cls = 'v-good', msg;
+
+  if (wasted > 0 && wasted >= spent * 0.25) {
+    cls = 'v-bad';
+    msg = `You've thrown <b>${fmtGBP(wasted)}</b> at stupid stuff this month — that's <b>${Math.round(wasted / spent * 100)}%</b> of everything you spent. Cut it out.`;
+  } else if (wasted > 0) {
+    cls = 'v-warn';
+    msg = `<b>${fmtGBP(wasted)}</b> already wasted this month. Small leaks sink ships. Log the next one and think twice.`;
+  } else if (overCats(exp).length) {
+    cls = 'v-warn';
+    const c = overCats(exp)[0];
+    msg = `You've blown past your <b>${esc(c.name)}</b> limit. Ease off before the month's out.`;
+  } else if (exp.length === 0) {
+    cls = 'v-good';
+    msg = `Clean slate this month. Keep it boring — boring is how you save.`;
+  } else if (unflagged > 0) {
+    cls = 'v-warn';
+    msg = `${unflagged} non-essential buy${unflagged > 1 ? 's' : ''} unflagged. Head to <b>Review</b> and be honest with yourself.`;
+  } else {
+    cls = 'v-good';
+    msg = `Nothing wasted so far. This is what discipline looks like — don't get comfortable.`;
+  }
+  v.className = 'verdict ' + cls;
+  v.innerHTML = msg;
+}
+
+function overCats(exp) {
+  const spentBy = {};
+  for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
+  return db.categories.filter(c => c.limit > 0 && (spentBy[c.id] || 0) > c.limit);
+}
+
+function renderHomeCats(exp) {
+  const box = $('#home-cats'); box.innerHTML = '';
+  const spentBy = {};
+  for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
+  const cats = db.categories
+    .map(c => ({ c, spent: spentBy[c.id] || 0 }))
+    .filter(x => x.spent > 0 || x.c.limit > 0)
+    .sort((a, b) => b.spent - a.spent);
+  if (!cats.length) { box.appendChild(el('div', 'empty', 'No spending yet this month.')); return; }
+  for (const { c, spent } of cats) box.appendChild(catRow(c, spent, false));
+}
+
+function catRow(c, spent, tappable) {
+  const has = c.limit > 0;
+  const pct = has ? Math.min(100, spent / c.limit * 100) : 0;
+  const over = has && spent > c.limit;
+  const near = has && !over && pct >= 80;
+  const row = el('div', 'cat' + (tappable ? ' tap' : ''));
+  row.innerHTML =
+    `<div class="cat-top">
+       <div class="cat-name"><span class="cat-emoji">${c.emoji}</span>${esc(c.name)}</div>
+       <div class="cat-amt"><b>${fmtGBP(spent)}</b>${has ? ' / ' + fmtGBP(c.limit) : ''}</div>
+     </div>
+     <div class="bar ${over ? 'over' : near ? 'near' : ''}"><span style="width:${has ? pct : 0}%"></span></div>`;
+  if (tappable) row.addEventListener('click', () => openCategory(c));
+  return row;
+}
+
+function renderRecent() {
+  const box = $('#home-recent'); box.innerHTML = '';
+  const recent = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 6);
+  if (!recent.length) { box.appendChild(el('div', 'empty', 'Nothing logged yet. Tap ＋ to start.')); return; }
+  for (const t of recent) box.appendChild(txRow(t));
+}
+
+function txRow(t) {
+  const c = catById(t.cat);
+  const income = t.kind === 'income';
+  const row = el('div', 'tx');
+  const tag = t.regret === 'stupid' ? '<span class="tag tag-stupid">STUPID</span>'
+            : t.regret === 'worth' ? '<span class="tag tag-worth">WORTH IT</span>' : '';
+  row.innerHTML =
+    `<div class="tx-ic">${income ? '💰' : c.emoji}</div>
+     <div class="tx-mid">
+       <div class="tx-title">${esc(t.note || (income ? 'Income' : c.name))} ${tag}</div>
+       <div class="tx-sub">${income ? 'Income' : esc(c.name)} · ${relDate(t.date)}</div>
+     </div>
+     <div class="tx-right">
+       <div class="tx-amt ${income ? 'in' : ''}">${income ? '+' : '−'}${fmt(t.amount, t.cur)}</div>
+       ${t.cur !== 'GBP' ? `<div class="tx-cur">≈ ${fmtGBP(toGBP(t.amount, t.cur))}</div>` : ''}
+     </div>`;
+  row.addEventListener('click', () => openTx(t));
+  return row;
+}
+
+/* ==================================================================== *
+ *  SPEND                                                               *
+ * ==================================================================== */
+function renderSpend() {
+  const exp = monthExpenses();
+  const spentBy = {};
+  for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
+  const box = $('#spend-cats'); box.innerHTML = '';
+  for (const c of db.categories) box.appendChild(catRow(c, spentBy[c.id] || 0, true));
+
+  const list = $('#spend-tx'); list.innerHTML = '';
+  const all = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date));
+  if (!all.length) { list.appendChild(el('div', 'empty', 'No transactions yet.')); return; }
+  for (const t of all.slice(0, 100)) list.appendChild(txRow(t));
+}
+
+/* ==================================================================== *
+ *  SAVE (goals)                                                        *
+ * ==================================================================== */
+function renderSave() {
+  const box = $('#goal-list'); box.innerHTML = '';
+  if (!db.goals.length) {
+    box.appendChild(el('div', 'empty', 'No goals yet. What are you actually saving for? Tap + Goal.'));
+    return;
+  }
+  for (const g of db.goals) {
+    const pct = g.target > 0 ? Math.min(100, g.saved / g.target * 100) : 0;
+    const done = g.target > 0 && g.saved >= g.target;
+    const card = el('div', 'goal' + (done ? ' done' : ''));
+    card.innerHTML =
+      `<div class="goal-top">
+         <div class="goal-name">${esc(g.name)}</div>
+         <div class="goal-pct">${done ? '✓ Done' : Math.round(pct) + '%'}</div>
+       </div>
+       <div class="goal-nums"><b>${fmt(g.saved, g.cur)}</b> of ${fmt(g.target, g.cur)}${g.cur !== 'GBP' ? ` · ≈ ${fmtGBP(toGBP(g.saved, g.cur))} saved` : ''}</div>
+       <div class="bar"><span style="width:${pct}%"></span></div>
+       <div class="goal-actions">
+         <button class="gbtn primary" data-add>＋ Add money</button>
+         <button class="gbtn" data-edit>Edit</button>
+       </div>`;
+    card.querySelector('[data-add]').addEventListener('click', () => addToGoal(g));
+    card.querySelector('[data-edit]').addEventListener('click', () => openGoal(g));
+    box.appendChild(card);
+  }
+}
+
+/* ==================================================================== *
+ *  LOANS                                                                *
+ * ==================================================================== */
+function renderLoans() {
+  $('#loan-summary').innerHTML =
+    `<div class="box owe"><div class="l">You owe</div><div class="v">${fmtGBP(oweGBP())}</div></div>
+     <div class="box owed"><div class="l">Owed to you</div><div class="v">${fmtGBP(owedGBP())}</div></div>`;
+  fillLoans('#owe-list', 'owe');
+  fillLoans('#owed-list', 'owed');
+}
+function fillLoans(sel, dir) {
+  const box = $(sel); box.innerHTML = '';
+  const list = db.loans.filter(l => l.dir === dir).sort((a, b) => (a.settled - b.settled) || (new Date(a.due || 0) - new Date(b.due || 0)));
+  if (!list.length) { box.appendChild(el('div', 'empty', dir === 'owe' ? 'No debts. Keep it that way.' : 'You haven\'t lent anyone money.')); return; }
+  for (const l of list) box.appendChild(loanCard(l));
+}
+function loanCard(l) {
+  const card = el('div', 'loan ' + l.dir + (l.settled ? ' settled' : ''));
+  let meta = '';
+  if (l.settled) meta = '<span>✓ Settled</span>';
+  else if (l.due) {
+    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
+    if (d < 0) meta = `<span class="overdue">Overdue by ${-d}d</span>`;
+    else if (d === 0) meta = `<span class="due-soon">Due today</span>`;
+    else if (d <= 7) meta = `<span class="due-soon">Due in ${d}d</span>`;
+    else meta = `<span>Due ${new Date(l.due).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}</span>`;
+  } else meta = '<span>No due date</span>';
+
+  card.innerHTML =
+    `<div class="loan-top">
+       <div class="loan-who">${esc(l.who)}</div>
+       <div class="loan-amt">${fmt(l.amount, l.cur)}</div>
+     </div>
+     <div class="loan-meta">${meta}${l.cur !== 'GBP' ? `<span>≈ ${fmtGBP(toGBP(l.amount, l.cur))}</span>` : ''}</div>
+     <div class="loan-actions">
+       ${l.settled ? '' : `<button class="gbtn primary" data-settle>Mark ${l.dir === 'owe' ? 'paid' : 'received'}</button>`}
+       <button class="gbtn" data-edit>Edit</button>
+     </div>`;
+  if (!l.settled) card.querySelector('[data-settle]').addEventListener('click', () => { l.settled = true; save(); toast('Nice. One less thing hanging over you.'); renderLoans(); });
+  card.querySelector('[data-edit]').addEventListener('click', () => openLoan(l));
+  return card;
+}
+
+/* ==================================================================== *
+ *  REVIEW (weekly regret)                                               *
+ * ==================================================================== */
+function renderReview() {
+  const weekAgo = new Date(now() - 7 * 86400000);
+  const recent = db.tx.filter(t => t.kind === 'expense' && new Date(t.date) >= weekAgo)
+                      .sort((a, b) => new Date(b.date) - new Date(a.date));
+  const spent = recent.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const wasted = recent.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const unflagged = recent.filter(t => t.regret == null && !catById(t.cat).essential);
+
+  const head = $('#review-head');
+  if (!recent.length) {
+    head.innerHTML = `<b>Nothing spent in the last 7 days.</b><br>Either you're disciplined or you forgot to log. Don't lie to yourself.`;
+  } else {
+    head.innerHTML =
+      `<span class="big">${fmtGBP(wasted)}</span> wasted in the last 7 days out of ${fmtGBP(spent)} spent.
+       ${unflagged.length ? `<br>${unflagged.length} non-essential buy${unflagged.length > 1 ? 's' : ''} below still need an honest verdict. Tap each one.` : '<br>All judged. Respect.'}
+       <div class="review-flags">
+         <span class="rf rf-stupid">${recent.filter(t => t.regret === 'stupid').length} stupid</span>
+         <span class="rf rf-worth">${recent.filter(t => t.regret === 'worth').length} worth it</span>
+       </div>`;
+  }
+
+  const box = $('#review-list'); box.innerHTML = '';
+  // unjudged non-essentials first, then the rest
+  const ordered = [...unflagged, ...recent.filter(t => !unflagged.includes(t))];
+  if (!ordered.length) { box.appendChild(el('div', 'empty', 'Nothing to review.')); return; }
+  for (const t of ordered) box.appendChild(reviewRow(t));
+}
+function reviewRow(t) {
+  const c = catById(t.cat);
+  const row = el('div', 'tx');
+  const needs = t.regret == null && !c.essential;
+  const tag = t.regret === 'stupid' ? '<span class="tag tag-stupid">STUPID</span>'
+            : t.regret === 'worth' ? '<span class="tag tag-worth">WORTH IT</span>'
+            : needs ? '<span class="tag" style="background:var(--warn-soft);color:var(--warn)">JUDGE?</span>' : '';
+  row.innerHTML =
+    `<div class="tx-ic">${c.emoji}</div>
+     <div class="tx-mid">
+       <div class="tx-title">${esc(t.note || c.name)} ${tag}</div>
+       <div class="tx-sub">${esc(c.name)} · ${relDate(t.date)} · ${fmt(t.amount, t.cur)}</div>
+     </div>`;
+  row.addEventListener('click', () => judgeSheet(t));
+  return row;
+}
+
+/* ==================================================================== *
+ *  SHEETS / MODALS                                                      *
+ * ==================================================================== */
+function openSheet(html) {
+  $('#sheet-body').innerHTML = `<div class="grab"></div>` + html;
+  $('#sheet').classList.remove('hidden');
+  return $('#sheet-body');
+}
+function closeSheet() { $('#sheet').classList.add('hidden'); }
+
+/* ---------- Add transaction (the core fast flow) ---------- */
+let draft = null;
+function openAdd() {
+  draft = { kind: 'expense', amount: '', cur: db.settings.mainCurrency, cat: 'food', note: '', regret: null };
+  renderAddSheet();
+}
+function renderAddSheet() {
+  const cats = db.categories.map(c =>
+    `<button class="chip ${draft.cat === c.id ? 'on' : ''}" data-cat="${c.id}"><span>${c.emoji}</span>${esc(c.name)}</button>`).join('');
+  const body = openSheet(`
+    <div class="seg" style="margin-bottom:18px">
+      <button data-kind="expense" class="${draft.kind === 'expense' ? 'on neg' : ''}">Spent</button>
+      <button data-kind="income" class="${draft.kind === 'income' ? 'on pos' : ''}">Got money</button>
+    </div>
+    <div class="amount-in">
+      <span class="cur">${draft.cur === 'GBP' ? '£' : 'د.م'}</span>
+      <input id="amt" type="number" inputmode="decimal" placeholder="0" value="${draft.amount}" />
+    </div>
+    <div class="cur-toggle">
+      <button data-cur="GBP" class="${draft.cur === 'GBP' ? 'on' : ''}">£ GBP</button>
+      <button data-cur="MAD" class="${draft.cur === 'MAD' ? 'on' : ''}">د.م MAD</button>
+    </div>
+    <div class="field" ${draft.kind === 'income' ? 'style="display:none"' : ''}>
+      <label>Category</label>
+      <div class="chip-row" id="cat-row">${cats}</div>
+    </div>
+    <div class="field">
+      <label>Note ${draft.kind === 'income' ? '(where from?)' : '(what was it?)'}</label>
+      <input id="note" type="text" placeholder="${draft.kind === 'income' ? 'e.g. freelance gig' : 'e.g. lunch, taxi...'}" value="${esc(draft.note)}" />
+    </div>
+    <button class="btn-primary" id="add-next">${draft.kind === 'income' ? 'Add income' : 'Continue'}</button>
+    <button class="btn-ghost" data-close>Cancel</button>
+  `);
+
+  body.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => { draft.kind = b.dataset.kind; syncDraft(body); renderAddSheet(); });
+  body.querySelectorAll('[data-cur]').forEach(b => b.onclick = () => { draft.cur = b.dataset.cur; syncDraft(body); renderAddSheet(); });
+  body.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { draft.cat = b.dataset.cat; body.querySelectorAll('[data-cat]').forEach(x => x.classList.toggle('on', x === b)); });
+  $('#add-next').onclick = () => { syncDraft(body); proceedAdd(); };
+  setTimeout(() => $('#amt') && $('#amt').focus(), 150);
+}
+function syncDraft(body) {
+  draft.amount = (body.querySelector('#amt') || {}).value || draft.amount;
+  draft.note = (body.querySelector('#note') || {}).value || '';
+}
+function proceedAdd() {
+  const amt = parseFloat(draft.amount);
+  if (!amt || amt <= 0) { toast('Put in an amount first.'); return; }
+  if (draft.kind === 'income') return commitTx(null);
+
+  const cat = catById(draft.cat);
+  // Pause-and-think for non-essential spends
+  if (!cat.essential) return pauseAndThink(amt);
+  commitTx(null);
+}
+function pauseAndThink(amt) {
+  const gbp = toGBP(amt, draft.cur);
+  openSheet(`
+    <div class="pause">
+      <div class="big">✋</div>
+      <h2>Hold on.</h2>
+      <p class="q">You're about to log <span class="amt">${fmt(amt, draft.cur)}</span> on
+      <b>${esc(catById(draft.cat).name)}</b>${draft.cur !== 'GBP' ? ` (≈ ${fmtGBP(gbp)})` : ''}.<br><br>
+      Do you <b>actually</b> need this — or is it another one for the pile?</p>
+    </div>
+    <button class="btn-primary" data-worth>I need it — it's worth it</button>
+    <button class="btn-primary danger" data-stupid>It's stupid, but log it anyway</button>
+    <button class="btn-ghost" data-back>← Back</button>
+  `);
+  const body = $('#sheet-body');
+  body.querySelector('[data-worth]').onclick = () => commitTx('worth');
+  body.querySelector('[data-stupid]').onclick = () => commitTx('stupid');
+  body.querySelector('[data-back]').onclick = renderAddSheet;
+}
+function commitTx(regret) {
+  const amt = parseFloat(draft.amount);
+  const t = {
+    id: uid(), kind: draft.kind, amount: Math.round(amt * 100) / 100,
+    cur: draft.cur, cat: draft.kind === 'income' ? 'income' : draft.cat,
+    note: draft.note.trim(), regret: draft.kind === 'income' ? null : regret,
+    date: new Date().toISOString(),
+  };
+  db.tx.unshift(t); save(); closeSheet();
+  if (regret === 'stupid') toast('Logged. You knew it too.');
+  else if (draft.kind === 'income') toast('Money in. Now save some before it vanishes.');
+  else toast('Logged.');
+  renderScreen(currentScreen);
+}
+
+/* ---------- Existing transaction ---------- */
+function openTx(t) {
+  const income = t.kind === 'income';
+  const body = openSheet(`
+    <h2>${income ? 'Income' : esc(catById(t.cat).name)}</h2>
+    <p class="sub">${fmt(t.amount, t.cur)} · ${new Date(t.date).toLocaleDateString(undefined,{weekday:'short',day:'numeric',month:'short'})}</p>
+    <div class="field"><label>Note</label><input id="e-note" type="text" value="${esc(t.note)}" /></div>
+    ${income ? '' : `
+    <div class="field"><label>Verdict</label>
+      <div class="seg">
+        <button data-r="worth" class="${t.regret==='worth'?'on pos':''}">Worth it</button>
+        <button data-r="stupid" class="${t.regret==='stupid'?'on neg':''}">Stupid</button>
+        <button data-r="none" class="${t.regret==null?'on':''}">Neutral</button>
+      </div>
+    </div>`}
+    <button class="btn-primary" id="e-save">Save</button>
+    <button class="btn-ghost del" id="e-del">Delete transaction</button>
+  `);
+  let r = t.regret;
+  body.querySelectorAll('[data-r]').forEach(b => b.onclick = () => {
+    r = b.dataset.r === 'none' ? null : b.dataset.r;
+    body.querySelectorAll('[data-r]').forEach(x => { x.className = ''; });
+    b.className = 'on ' + (r === 'worth' ? 'pos' : r === 'stupid' ? 'neg' : '');
+  });
+  $('#e-save').onclick = () => { t.note = $('#e-note').value.trim(); t.regret = r; save(); closeSheet(); toast('Updated.'); renderScreen(currentScreen); };
+  $('#e-del').onclick = () => { if (confirm('Delete this transaction?')) { db.tx = db.tx.filter(x => x.id !== t.id); save(); closeSheet(); renderScreen(currentScreen); } };
+}
+
+/* quick judge from review */
+function judgeSheet(t) {
+  if (t.kind === 'income') return openTx(t);
+  const body = openSheet(`
+    <h2>${esc(t.note || catById(t.cat).name)}</h2>
+    <p class="sub">${fmt(t.amount, t.cur)} · ${esc(catById(t.cat).name)} · ${relDate(t.date)}</p>
+    <p class="q" style="color:var(--muted);text-align:center;margin:6px 0 18px">Looking back — was this a good use of money?</p>
+    <button class="btn-primary" data-worth>Worth it</button>
+    <button class="btn-primary danger" data-stupid>Stupid</button>
+    <button class="btn-ghost" data-close>Skip</button>
+  `);
+  body.querySelector('[data-worth]').onclick = () => { t.regret = 'worth'; save(); closeSheet(); renderReview(); };
+  body.querySelector('[data-stupid]').onclick = () => { t.regret = 'stupid'; save(); closeSheet(); toast('Honest. Remember this next time.'); renderReview(); };
+}
+
+/* ---------- Category editor ---------- */
+function openCategory(c) {
+  const body = openSheet(`
+    <h2>${c.emoji} ${esc(c.name)}</h2>
+    <p class="sub">Set a monthly limit. The app warns you as you approach it.</p>
+    <div class="field"><label>Name</label><input id="c-name" type="text" value="${esc(c.name)}" /></div>
+    <div class="field"><label>Emoji</label><input id="c-emoji" type="text" maxlength="2" value="${esc(c.emoji)}" /></div>
+    <div class="field"><label>Monthly limit (£, 0 = none)</label><input id="c-limit" type="number" inputmode="decimal" value="${c.limit}" /></div>
+    <div class="field"><label>Type</label>
+      <div class="seg">
+        <button data-e="1" class="${c.essential?'on':''}">Essential</button>
+        <button data-e="0" class="${!c.essential?'on neg':''}">Non-essential</button>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:-6px">Non-essential buys trigger the pause-and-think prompt.</p>
+    <button class="btn-primary" id="c-save">Save</button>
+    ${c.id !== 'other' && c.id !== 'income' ? '<button class="btn-ghost del" id="c-del">Delete category</button>' : ''}
+  `);
+  let ess = c.essential;
+  body.querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
+    ess = b.dataset.e === '1';
+    body.querySelectorAll('[data-e]').forEach(x => x.className = '');
+    b.className = 'on ' + (ess ? '' : 'neg');
+  });
+  $('#c-save').onclick = () => {
+    c.name = $('#c-name').value.trim() || c.name;
+    c.emoji = $('#c-emoji').value.trim() || '•';
+    c.limit = Math.max(0, parseFloat($('#c-limit').value) || 0);
+    c.essential = ess; save(); closeSheet(); renderScreen(currentScreen);
+  };
+  const del = $('#c-del');
+  if (del) del.onclick = () => {
+    if (confirm('Delete category? Its transactions move to Other.')) {
+      db.tx.forEach(t => { if (t.cat === c.id) t.cat = 'other'; });
+      db.categories = db.categories.filter(x => x.id !== c.id);
+      save(); closeSheet(); renderScreen(currentScreen);
+    }
+  };
+}
+function openNewCategory() {
+  const body = openSheet(`
+    <h2>New category</h2>
+    <div class="field"><label>Name</label><input id="n-name" type="text" placeholder="e.g. Coffee" /></div>
+    <div class="field"><label>Emoji</label><input id="n-emoji" type="text" maxlength="2" placeholder="☕" /></div>
+    <div class="field"><label>Monthly limit (£, 0 = none)</label><input id="n-limit" type="number" inputmode="decimal" placeholder="0" /></div>
+    <div class="field"><label>Type</label>
+      <div class="seg"><button data-e="1" class="on">Essential</button><button data-e="0">Non-essential</button></div>
+    </div>
+    <button class="btn-primary" id="n-save">Add category</button>
+    <button class="btn-ghost" data-close>Cancel</button>
+  `);
+  let ess = true;
+  body.querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
+    ess = b.dataset.e === '1'; body.querySelectorAll('[data-e]').forEach(x => x.className = '');
+    b.className = 'on ' + (ess ? '' : 'neg');
+  });
+  $('#n-save').onclick = () => {
+    const name = $('#n-name').value.trim(); if (!name) { toast('Give it a name.'); return; }
+    db.categories.splice(db.categories.length - 1, 0, {
+      id: uid(), name, emoji: $('#n-emoji').value.trim() || '•',
+      limit: Math.max(0, parseFloat($('#n-limit').value) || 0), essential: ess,
+    });
+    save(); closeSheet(); renderSpend();
+  };
+}
+
+/* ---------- Goals ---------- */
+function openGoal(g) {
+  const isNew = !g;
+  g = g || { id: uid(), name: '', target: '', cur: db.settings.mainCurrency, saved: 0, _new: true };
+  const body = openSheet(`
+    <h2>${isNew ? 'New savings goal' : 'Edit goal'}</h2>
+    <div class="field"><label>What for?</label><input id="g-name" type="text" placeholder="e.g. Emergency fund, trip home" value="${esc(g.name)}" /></div>
+    <div class="field"><label>Target amount</label><input id="g-target" type="number" inputmode="decimal" placeholder="2000" value="${g.target || ''}" /></div>
+    <div class="field"><label>Currency</label>
+      <div class="seg"><button data-c="GBP" class="${g.cur==='GBP'?'on':''}">£ GBP</button><button data-c="MAD" class="${g.cur==='MAD'?'on':''}">د.م MAD</button></div>
+    </div>
+    <button class="btn-primary" id="g-save">${isNew ? 'Create goal' : 'Save'}</button>
+    ${isNew ? '' : '<button class="btn-ghost del" id="g-del">Delete goal</button>'}
+  `);
+  let cur = g.cur;
+  body.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { cur = b.dataset.c; body.querySelectorAll('[data-c]').forEach(x => x.classList.toggle('on', x === b)); });
+  $('#g-save').onclick = () => {
+    g.name = $('#g-name').value.trim() || 'Goal';
+    g.target = Math.max(0, parseFloat($('#g-target').value) || 0);
+    g.cur = cur;
+    if (g._new) { delete g._new; db.goals.push(g); }
+    save(); closeSheet(); renderSave();
+  };
+  const del = $('#g-del'); if (del) del.onclick = () => { if (confirm('Delete this goal?')) { db.goals = db.goals.filter(x => x.id !== g.id); save(); closeSheet(); renderSave(); } };
+}
+function addToGoal(g) {
+  const body = openSheet(`
+    <h2>Add to ${esc(g.name)}</h2>
+    <p class="sub">${fmt(g.saved, g.cur)} saved so far${g.target ? ` of ${fmt(g.target, g.cur)}` : ''}.</p>
+    <div class="amount-in"><span class="cur">${g.cur === 'GBP' ? '£' : 'د.م'}</span><input id="ga" type="number" inputmode="decimal" placeholder="0" /></div>
+    <button class="btn-primary" id="ga-save">Stash it</button>
+    <button class="btn-ghost" id="ga-sub">Take some out</button>
+  `);
+  setTimeout(() => $('#ga').focus(), 150);
+  $('#ga-save').onclick = () => {
+    const v = parseFloat($('#ga').value); if (!v || v <= 0) { toast('Amount?'); return; }
+    g.saved = Math.round((g.saved + v) * 100) / 100; save(); closeSheet();
+    toast('Saved. Future you says thanks.'); renderSave();
+  };
+  $('#ga-sub').onclick = () => {
+    const v = parseFloat($('#ga').value); if (!v || v <= 0) { toast('Amount?'); return; }
+    g.saved = Math.max(0, Math.round((g.saved - v) * 100) / 100); save(); closeSheet();
+    toast('Taken out. Hope it was worth it.'); renderSave();
+  };
+}
+
+/* ---------- Loans ---------- */
+function openLoan(l) {
+  const isNew = !l.who && l._new;
+  const body = openSheet(`
+    <h2>${isNew ? (l.dir === 'owe' ? 'Money you owe' : 'Money you lent') : 'Edit'}</h2>
+    <div class="field"><label>${l.dir === 'owe' ? 'Who do you owe?' : 'Who owes you?'}</label><input id="l-who" type="text" placeholder="Name" value="${esc(l.who || '')}" /></div>
+    <div class="field"><label>Amount</label><input id="l-amt" type="number" inputmode="decimal" placeholder="0" value="${l.amount || ''}" /></div>
+    <div class="field"><label>Currency</label>
+      <div class="seg"><button data-c="GBP" class="${l.cur==='GBP'?'on':''}">£ GBP</button><button data-c="MAD" class="${l.cur==='MAD'?'on':''}">د.م MAD</button></div>
+    </div>
+    <div class="field"><label>Due date (optional)</label><input id="l-due" type="date" value="${l.due ? l.due.slice(0,10) : ''}" /></div>
+    <button class="btn-primary" id="l-save">Save</button>
+    ${isNew ? '' : '<button class="btn-ghost del" id="l-del">Delete</button>'}
+  `);
+  let cur = l.cur || 'GBP';
+  body.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { cur = b.dataset.c; body.querySelectorAll('[data-c]').forEach(x => x.classList.toggle('on', x === b)); });
+  $('#l-save').onclick = () => {
+    const who = $('#l-who').value.trim(); const amt = parseFloat($('#l-amt').value);
+    if (!who) { toast('Who?'); return; } if (!amt || amt <= 0) { toast('How much?'); return; }
+    l.who = who; l.amount = Math.round(amt * 100) / 100; l.cur = cur;
+    l.due = $('#l-due').value ? new Date($('#l-due').value).toISOString() : null;
+    if (l._new) { delete l._new; db.loans.push(l); }
+    save(); closeSheet(); renderLoans();
+  };
+  const del = $('#l-del'); if (del) del.onclick = () => { if (confirm('Delete this loan?')) { db.loans = db.loans.filter(x => x.id !== l.id); save(); closeSheet(); renderLoans(); } };
+}
+function newLoan(dir) { openLoan({ id: uid(), dir, cur: db.settings.mainCurrency, settled: false, _new: true }); }
+
+/* ---------- Rate / settings ---------- */
+function renderRateChip() {
+  $('#rate-chip').innerHTML = `£1 = <b>${db.settings.rate}</b> د.م`;
+}
+function openRate() {
+  const s = db.settings;
+  const body = openSheet(`
+    <h2>Exchange rate</h2>
+    <p class="sub">Totals are shown in £. This converts your MAD entries.</p>
+    <div class="field"><label>Rate source</label>
+      <div class="seg">
+        <button data-live="1" class="${s.rateLive?'on':''}">Live (auto)</button>
+        <button data-live="0" class="${!s.rateLive?'on':''}">Manual</button>
+      </div>
+    </div>
+    <div class="field"><label>£1 = ? MAD</label><input id="r-val" type="number" inputmode="decimal" value="${s.rate}" ${s.rateLive?'disabled':''} /></div>
+    <p class="sub">${s.rateFetched ? 'Last live update: ' + new Date(s.rateFetched).toLocaleString() : 'No live update yet.'}</p>
+    <button class="btn-primary" id="r-save">Save</button>
+    <div class="settings-link"><button id="open-settings">App settings</button></div>
+  `);
+  let live = s.rateLive;
+  body.querySelectorAll('[data-live]').forEach(b => b.onclick = () => {
+    live = b.dataset.live === '1';
+    body.querySelectorAll('[data-live]').forEach(x => x.classList.toggle('on', x === b));
+    $('#r-val').disabled = live;
+  });
+  $('#r-save').onclick = async () => {
+    s.rateLive = live;
+    if (!live) s.rate = Math.max(0.01, parseFloat($('#r-val').value) || s.rate);
+    save(); closeSheet(); renderRateChip();
+    if (live) await refreshRate(true);
+    renderScreen(currentScreen);
+  };
+  $('#open-settings').onclick = openSettings;
+}
+function openSettings() {
+  const body = openSheet(`
+    <h2>Settings</h2>
+    <p class="sub">Reckon v1 · data stored on this device.</p>
+    <button class="btn-primary" id="st-pin">Change passcode</button>
+    <button class="btn-ghost" id="st-export">Export my data (backup)</button>
+    <button class="btn-ghost del" id="st-wipe">Wipe everything</button>
+    <div class="settings-link">Cloud backup (sync across devices) coming next.</div>
+  `);
+  $('#st-pin').onclick = () => { db.settings.passcode = null; save(); closeSheet(); startLock(); };
+  $('#st-export').onclick = () => {
+    const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded.');
+  };
+  $('#st-wipe').onclick = () => { if (confirm('Wipe ALL data permanently?')) { localStorage.removeItem(KEY); db = DEFAULTS(); closeSheet(); startLock(); } };
+}
+
+/* ==================================================================== *
+ *  WIRING                                                               *
+ * ==================================================================== */
+function bindOnce() {
+  // lock keypad
+  $$('.key').forEach(k => k.onclick = () => pinKey(k.dataset.k));
+  // nav
+  $$('.nav-btn').forEach(b => b.onclick = () => go(b.dataset.nav));
+  // fab
+  $('#fab').onclick = openAdd;
+  // rate chip
+  $('#rate-chip').onclick = openRate;
+  // sheet close
+  $('#sheet').addEventListener('click', e => { if (e.target.matches('[data-close], .sheet-backdrop')) closeSheet(); });
+  // add buttons per screen
+  document.addEventListener('click', e => {
+    const id = e.target.id;
+    if (id === 'add-cat') openNewCategory();
+    else if (id === 'add-goal') openGoal(null);
+    else if (id === 'add-owe') newLoan('owe');
+    else if (id === 'add-owed') newLoan('owed');
+  });
+}
+
+function bootApp() {
+  const h = now().getHours();
+  const hi = h < 5 ? 'Still up?' : h < 12 ? 'Morning' : h < 18 ? 'Afternoon' : 'Evening';
+  $('#greeting').textContent = hi;
+  const wasted = monthExpenses().filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  $('#topbar-sub').textContent = wasted > 0 ? `${fmtGBP(wasted)} wasted this month` : 'the honest ledger';
+  renderRateChip();
+  go('home');
+  refreshRate(false);
+}
+
+/* start */
+bindOnce();
+startLock();
+
+/* PWA service worker */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}

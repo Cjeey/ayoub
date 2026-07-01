@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d0f14" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Reckon — money, honestly</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <!-- ===================== LOCK SCREEN ===================== -->
+  <section id="lock" class="lock hidden">
+    <div class="lock-box">
+      <div class="lock-logo">₤</div>
+      <h1 class="lock-title">Reckon</h1>
+      <p id="lock-sub" class="lock-sub">Enter your passcode.</p>
+      <div id="pin-dots" class="pin-dots"></div>
+      <div class="keypad">
+        <button class="key" data-k="1">1</button>
+        <button class="key" data-k="2">2</button>
+        <button class="key" data-k="3">3</button>
+        <button class="key" data-k="4">4</button>
+        <button class="key" data-k="5">5</button>
+        <button class="key" data-k="6">6</button>
+        <button class="key" data-k="7">7</button>
+        <button class="key" data-k="8">8</button>
+        <button class="key" data-k="9">9</button>
+        <button class="key key-ghost" data-k="reset">↺</button>
+        <button class="key" data-k="0">0</button>
+        <button class="key key-ghost" data-k="del">⌫</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== APP ===================== -->
+  <main id="app" class="app hidden">
+    <header class="topbar">
+      <div>
+        <div class="topbar-hi" id="greeting">Reckon</div>
+        <div class="topbar-sub" id="topbar-sub">the honest ledger</div>
+      </div>
+      <button class="rate-chip" id="rate-chip" title="Exchange rate">£/د.م</button>
+    </header>
+
+    <div id="screens">
+      <!-- Home -->
+      <section class="screen" data-screen="home">
+        <div class="net-card">
+          <div class="net-label">NET WORTH · in £</div>
+          <div class="net-value" id="net-value">£0</div>
+          <div class="net-break" id="net-break"></div>
+        </div>
+
+        <div class="stat-row">
+          <div class="stat">
+            <div class="stat-label">Spent this month</div>
+            <div class="stat-value" id="stat-spent">£0</div>
+          </div>
+          <div class="stat stat-bad">
+            <div class="stat-label">Wasted this month</div>
+            <div class="stat-value" id="stat-wasted">£0</div>
+          </div>
+        </div>
+
+        <div id="verdict" class="verdict"></div>
+
+        <div class="section-head"><span>This month by category</span></div>
+        <div id="home-cats" class="cat-list"></div>
+
+        <div class="section-head"><span>Recent</span></div>
+        <div id="home-recent" class="tx-list"></div>
+      </section>
+
+      <!-- Spending -->
+      <section class="screen hidden" data-screen="spend">
+        <div class="section-head"><span>Category limits (monthly)</span><button class="mini-btn" id="add-cat">+ Category</button></div>
+        <div id="spend-cats" class="cat-list"></div>
+        <div class="section-head"><span>All transactions</span></div>
+        <div id="spend-tx" class="tx-list"></div>
+      </section>
+
+      <!-- Save -->
+      <section class="screen hidden" data-screen="save">
+        <div class="section-head"><span>Savings goals</span><button class="mini-btn" id="add-goal">+ Goal</button></div>
+        <div id="goal-list" class="goal-list"></div>
+      </section>
+
+      <!-- Loans -->
+      <section class="screen hidden" data-screen="loans">
+        <div class="loan-summary" id="loan-summary"></div>
+        <div class="section-head"><span>You owe</span><button class="mini-btn" id="add-owe">+ Debt</button></div>
+        <div id="owe-list" class="loan-list"></div>
+        <div class="section-head"><span>Owed to you</span><button class="mini-btn" id="add-owed">+ Lent</button></div>
+        <div id="owed-list" class="loan-list"></div>
+      </section>
+
+      <!-- Review -->
+      <section class="screen hidden" data-screen="review">
+        <div class="review-head" id="review-head"></div>
+        <div id="review-list" class="tx-list"></div>
+      </section>
+    </div>
+
+    <!-- FAB -->
+    <button id="fab" class="fab" aria-label="Add">＋</button>
+
+    <!-- Bottom nav -->
+    <nav class="nav">
+      <button class="nav-btn active" data-nav="home"><span class="ni">◎</span><span>Home</span></button>
+      <button class="nav-btn" data-nav="spend"><span class="ni">▤</span><span>Spend</span></button>
+      <button class="nav-btn" data-nav="save"><span class="ni">◆</span><span>Save</span></button>
+      <button class="nav-btn" data-nav="loans"><span class="ni">⇄</span><span>Loans</span></button>
+      <button class="nav-btn" data-nav="review"><span class="ni">⚖</span><span>Review</span></button>
+    </nav>
+  </main>
+
+  <!-- ===================== SHEET (modal) ===================== -->
+  <div id="sheet" class="sheet-wrap hidden">
+    <div class="sheet-backdrop" data-close></div>
+    <div class="sheet" id="sheet-body"></div>
+  </div>
+
+  <!-- ===================== TOAST ===================== -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="script.js"></script>
+</body>
+</html>
