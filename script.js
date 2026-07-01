@@ -23,6 +23,8 @@ const DEFAULTS = () => ({
     cloudOn: false,            // cloud backup enabled
     syncCode: null,            // secret vault key (local)
     lastSync: null,            // last successful cloud sync (ms)
+    aiKey: null,               // Google AI Studio key (LOCAL ONLY, never synced)
+    aiModel: 'gemini-2.5-flash',
   },
   categories: [
     { id: 'food',   name: 'Food & groceries', emoji: '🛒', limit: 250, essential: true },
@@ -42,6 +44,8 @@ const DEFAULTS = () => ({
   goals: [],      // { id, name, target, cur, saved }
   loans: [],      // { id, dir:'owe'|'owed', who, amount, cur, due, settled }
   recurring: [],  // { id, name, amount, cur, cat, kind, day, active, lastPosted:'YYYY-M' }
+  coach: { messages: [] },   // chat history with the AI coach
+  checkins: {},   // { lastMorning, lastEvening, lastWeekly, intention:{day,mode} }
   _rev: null,     // ISO string, bumped on every save() — drives cloud last-write-wins
 });
 
@@ -96,6 +100,7 @@ const Cloud = {
     delete copy.settings.syncCode;
     delete copy.settings.cloudOn;
     delete copy.settings.lastSync;
+    delete copy.settings.aiKey;      // AI key never leaves this device
     return copy;
   },
 
@@ -147,7 +152,7 @@ const Cloud = {
         // keep local-only settings, take everything else from cloud
         const localOnly = {
           passcode: db.settings.passcode, syncCode: db.settings.syncCode,
-          cloudOn: true, lastSync: Date.now(),
+          cloudOn: true, lastSync: Date.now(), aiKey: db.settings.aiKey,
         };
         db = { ...DEFAULTS(), ...incoming };
         db.settings = { ...DEFAULTS().settings, ...(incoming.settings || {}), ...localOnly };
@@ -165,7 +170,7 @@ const Cloud = {
     const rows = await this.rpc('vault_pull', { p_code: db.settings.syncCode });
     const remote = Array.isArray(rows) ? rows[0] : rows;
     if (!remote || !remote.data) { db.settings.syncCode = null; throw new Error('No vault found for that code.'); }
-    const localOnly = { passcode: db.settings.passcode, syncCode: db.settings.syncCode, cloudOn: true, lastSync: Date.now() };
+    const localOnly = { passcode: db.settings.passcode, syncCode: db.settings.syncCode, cloudOn: true, lastSync: Date.now(), aiKey: db.settings.aiKey };
     db = { ...DEFAULTS(), ...remote.data };
     db.settings = { ...DEFAULTS().settings, ...(remote.data.settings || {}), ...localOnly };
     save(true);
@@ -337,11 +342,12 @@ function go(screen) {
   currentScreen = screen;
   $$('.screen').forEach(s => s.classList.toggle('hidden', s.dataset.screen !== screen));
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === screen));
+  $('#fab').classList.toggle('hidden', screen === 'coach');   // FAB would cover the chat bar
   window.scrollTo(0, 0);
   renderScreen(screen);
 }
 function renderScreen(s) {
-  ({ home: renderHome, spend: renderSpend, save: renderSave, loans: renderLoans, review: renderReview }[s] || (() => {}))();
+  ({ home: renderHome, spend: renderSpend, save: renderSave, loans: renderLoans, review: renderReview, coach: renderCoach }[s] || (() => {}))();
 }
 
 /* ==================================================================== *
@@ -394,6 +400,7 @@ function renderAlerts() {
 }
 
 function renderHome() {
+  renderCheckinCard();
   renderAlerts();
   const net = liquidGBP() + savedGBP() + owedGBP() - oweGBP();
   const nv = $('#net-value');
@@ -826,6 +833,10 @@ function renderAddSheet() {
   const cats = db.categories.map(c =>
     `<button class="chip ${draft.cat === c.id ? 'on' : ''}" data-cat="${c.id}"><span>${c.emoji}</span>${esc(c.name)}</button>`).join('');
   const body = openSheet(`
+    <div class="quick-wrap">
+      <input id="quick" type="text" placeholder="⚡ Type it: &quot;45 dh taxi&quot; or &quot;coffee 3.50&quot;" autocomplete="off" value="" />
+      <div class="quick-hint">Hit enter and I'll fill everything in below${AI.ready() ? ' (AI-assisted)' : ''}</div>
+    </div>
     <div class="seg" style="margin-bottom:18px">
       <button data-kind="expense" class="${draft.kind === 'expense' ? 'on neg' : ''}">Spent</button>
       <button data-kind="income" class="${draft.kind === 'income' ? 'on pos' : ''}">Got money</button>
@@ -850,11 +861,19 @@ function renderAddSheet() {
     <button class="btn-ghost" data-close>Cancel</button>
   `);
 
+  const quick = body.querySelector('#quick');
+  quick.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const v = quick.value.trim();
+    if (!v) return;
+    quick.disabled = true;
+    applyQuick(v, quick).finally(() => { const q = $('#quick'); if (q) q.disabled = false; });
+  });
   body.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => { draft.kind = b.dataset.kind; syncDraft(body); renderAddSheet(); });
   body.querySelectorAll('[data-cur]').forEach(b => b.onclick = () => { draft.cur = b.dataset.cur; syncDraft(body); renderAddSheet(); });
   body.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { draft.cat = b.dataset.cat; body.querySelectorAll('[data-cat]').forEach(x => x.classList.toggle('on', x === b)); });
   $('#add-next').onclick = () => { syncDraft(body); proceedAdd(); };
-  setTimeout(() => $('#amt') && $('#amt').focus(), 150);
+  setTimeout(() => { const q = $('#quick'); if (q && !draft.amount) q.focus(); else if ($('#amt')) $('#amt').focus(); }, 150);
 }
 function syncDraft(body) {
   draft.amount = (body.querySelector('#amt') || {}).value || draft.amount;
@@ -1142,17 +1161,32 @@ function openSettings() {
     <h2>Settings</h2>
     <p class="sub">Reckon · your money, honestly.</p>
     ${cloud}
+    <div class="cloud-box">
+      <div class="cloud-row"><b>✦ AI coach ${db.settings.aiKey ? 'is connected' : 'not set up'}</b></div>
+      <div class="cloud-status">${db.settings.aiKey ? 'Runs on your Google AI key, stored only on this device. Model: ' + esc(db.settings.aiModel || 'gemini-2.5-flash') : 'Connect a Google AI Studio key in the Coach tab to chat with your money.'}</div>
+      ${db.settings.aiKey ? '<button class="btn-ghost" id="st-aikey">Change API key</button><button class="btn-ghost del" id="st-aioff">Disconnect AI</button>' : ''}
+    </div>
     <button class="btn-ghost" id="st-pin">Change passcode</button>
     <button class="btn-ghost" id="st-export">Export my data (JSON)</button>
     <button class="btn-ghost" id="st-import">Import data (restore backup)</button>
     <button class="btn-ghost del" id="st-wipe">Wipe everything</button>
   `);
   $('#st-import').onclick = openImport;
+  const aik = $('#st-aikey'); if (aik) aik.onclick = () => {
+    const k = (prompt('Paste your new Google AI Studio key:') || '').trim();
+    if (!k) return;                                   // backed out — old key untouched
+    if (k.length < 20) { toast('That doesn\'t look like a key.'); return; }
+    db.settings.aiKey = k; save(true); toast('AI key updated.');
+  };
+  const aio = $('#st-aioff'); if (aio) aio.onclick = () => { db.settings.aiKey = null; save(true); closeSheet(); toast('AI disconnected.'); };
   $('#st-pin').onclick = () => { db.settings.passcode = null; save(); closeSheet(); startLock(); };
   $('#st-export').onclick = () => {
-    const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+    // never let secrets ride along in a shareable file
+    const copy = JSON.parse(JSON.stringify(db));
+    delete copy.settings.passcode; delete copy.settings.syncCode; delete copy.settings.aiKey;
+    const blob = new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-    a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded.');
+    a.download = 'reckon-backup.json'; a.click(); toast('Backup downloaded (passcode, sync code & AI key excluded).');
   };
   $('#st-wipe').onclick = () => { if (confirm('Wipe ALL data permanently? If cloud backup is on, your cloud copy stays under its code.')) { localStorage.removeItem(KEY); db = DEFAULTS(); closeSheet(); startLock(); } };
   const on = $('#st-cloudon'); if (on) on.onclick = cloudTurnOn;
@@ -1192,9 +1226,9 @@ function openImport() {
 function importData(data, mode) {
   const arrays = ['tx', 'goals', 'loans', 'recurring', 'categories'];
   if (mode === 'replace') {
-    const keepPin = db.settings.passcode, keepCode = db.settings.syncCode, keepCloud = db.settings.cloudOn;
+    const keepPin = db.settings.passcode, keepCode = db.settings.syncCode, keepCloud = db.settings.cloudOn, keepAi = db.settings.aiKey;
     db = { ...DEFAULTS(), ...data };
-    db.settings = { ...DEFAULTS().settings, ...(data.settings || {}), passcode: keepPin, syncCode: keepCode, cloudOn: keepCloud };
+    db.settings = { ...DEFAULTS().settings, ...(data.settings || {}), passcode: keepPin, syncCode: keepCode, cloudOn: keepCloud, aiKey: keepAi };
   } else {
     // merge: append arrays (skip exact id dupes), take scalar settings we care about
     for (const k of arrays) {
@@ -1263,6 +1297,390 @@ function cloudLinkSheet() {
 }
 
 /* ==================================================================== *
+ *  AI (Gemini) — the brain behind the coach and smart parsing.          *
+ *  The key lives in localStorage only; the app calls Google directly.   *
+ * ==================================================================== */
+const AI = {
+  ready() { return !!db.settings.aiKey; },
+
+  async generate(contents, systemText, jsonMode) {
+    const model = db.settings.aiModel || 'gemini-2.5-flash';
+    const body = {
+      contents,
+      systemInstruction: { parts: [{ text: systemText }] },
+      generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+    };
+    if (jsonMode) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.temperature = 0.1; }
+    // 2.5-series models think by default; turn it off for snappy, cheap replies
+    if (model.startsWith('gemini-2.5')) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+
+    const call = async (b) => {
+      try {
+        return await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': db.settings.aiKey }, body: JSON.stringify(b) });
+      } catch (e) { throw new Error('network'); }   // fetch itself failed = actual connectivity problem
+    };
+    const keyRejected = async (r) => /API_KEY_INVALID|API key not valid/i.test(await r.clone().text().catch(() => ''));
+
+    let r = await call(body);
+    if (r.status === 400) {
+      if (await keyRejected(r)) throw new Error('bad-key');  // Google says 400, not 401, for bad keys
+      if (body.generationConfig.thinkingConfig) {
+        delete body.generationConfig.thinkingConfig;         // model doesn't take the field — retry without
+        r = await call(body);
+        if (r.status === 400 && await keyRejected(r)) throw new Error('bad-key');
+      }
+    }
+    if (r.status === 401 || r.status === 403) throw new Error('bad-key');
+    if (r.status === 429) throw new Error('rate-limit');
+    if (r.status >= 500) throw new Error('server');
+    if (!r.ok) throw new Error('ai-' + r.status);
+    const j = await r.json();
+    if (j.promptFeedback?.blockReason || (j.candidates || [])[0]?.finishReason === 'SAFETY') throw new Error('blocked');
+    const text = (((j.candidates || [])[0] || {}).content || {}).parts?.map(p => p.text).join('') || '';
+    if (!text) throw new Error('empty');
+    return text;
+  },
+};
+
+/* Full-memory snapshot of the user's money, fed to the coach. */
+function buildCoachContext() {
+  const L = [];
+  const rate = db.settings.rate;
+  L.push(`You are the coach inside "Reckon", a personal money app. The user tracks money in GBP (£, main) and MAD (Moroccan dirham, د.م). Current rate: £1 = ${rate} MAD.`);
+  L.push(`PERSONA: harsh-but-fair accountability coach. Blunt, direct, a little sharp — but always concrete and helpful. Use their real numbers. Keep replies short (2–6 sentences, plain text, no markdown headers). If they ask "can I afford X", do the actual math against cash, upcoming debts and category limits, then give a straight yes/no with the reason.`);
+
+  L.push(`\n== CURRENT POSITION (all £) ==`);
+  L.push(`Cash: ${fmtGBP(liquidGBP())} | Saved in goals: ${fmtGBP(savedGBP())} | Owed to them: ${fmtGBP(owedGBP())} | They owe: ${fmtGBP(oweGBP())} | Net: ${fmtGBP(liquidGBP() + savedGBP() + owedGBP() - oweGBP())}`);
+
+  const exp = monthExpenses();
+  const spent = exp.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const wasted = exp.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  L.push(`\n== THIS MONTH ==`);
+  L.push(`Spent ${fmtGBP(spent)}, of which flagged stupid/wasted: ${fmtGBP(wasted)}. Income this month: ${fmtGBP(monthIncome().reduce((s, t) => s + toGBP(t.amount, t.cur), 0))}.`);
+  const spentBy = {};
+  for (const t of exp) spentBy[t.cat] = (spentBy[t.cat] || 0) + toGBP(t.amount, t.cur);
+  for (const c of db.categories) {
+    const sp = spentBy[c.id] || 0;
+    if (sp > 0 || c.limit > 0) L.push(`- ${c.name}: ${fmtGBP(sp)}${c.limit ? ` of ${fmtGBP(c.limit)} limit${sp > c.limit ? ' (OVER)' : ''}` : ''}${c.essential ? '' : ' [non-essential]'}`);
+  }
+
+  const hist = {};
+  for (const t of db.tx) {
+    if (t.kind !== 'expense') continue;
+    const k = monthKey(new Date(t.date));
+    hist[k] = hist[k] || { total: 0, waste: 0 };
+    hist[k].total += toGBP(t.amount, t.cur);
+    if (t.regret === 'stupid') hist[k].waste += toGBP(t.amount, t.cur);
+  }
+  L.push(`\n== MONTHLY HISTORY (spend / wasted) ==`);
+  const base = now();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
+    const h = hist[monthKey(d)];
+    if (h) L.push(`- ${d.toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}: ${fmtGBP(h.total)} / ${fmtGBP(h.waste)}`);
+  }
+
+  if (db.goals.length) {
+    L.push(`\n== SAVINGS GOALS ==`);
+    for (const g of db.goals) L.push(`- ${g.name}: ${fmt(g.saved, g.cur)} of ${fmt(g.target, g.cur)}`);
+  }
+  const activeLoans = db.loans.filter(l => !l.settled);
+  if (activeLoans.length) {
+    L.push(`\n== LOANS ==`);
+    for (const l of activeLoans) L.push(`- ${l.dir === 'owe' ? 'They owe' : 'Owed to them by'} ${l.who}: ${fmt(l.amount, l.cur)}${l.due ? `, due ${new Date(l.due).toLocaleDateString()}` : ''}`);
+  }
+  if ((db.recurring || []).length) {
+    L.push(`\n== RECURRING (monthly) ==`);
+    for (const r of db.recurring) if (r.active) L.push(`- ${r.name}: ${r.kind === 'income' ? '+' : ''}${fmt(r.amount, r.cur)} on day ${r.day}`);
+  }
+
+  const recent = [...db.tx].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 30);
+  if (recent.length) {
+    L.push(`\n== RECENT TRANSACTIONS (newest first) ==`);
+    for (const t of recent) L.push(`- ${new Date(t.date).toLocaleDateString()} ${t.kind === 'income' ? 'IN' : catById(t.cat).name} ${fmt(t.amount, t.cur)}${t.note ? ` "${t.note}"` : ''}${t.regret ? ` [${t.regret}]` : ''}`);
+  }
+  const intent = (db.checkins || {}).intention;
+  if (intent && intent.day === dayKeyOf(now())) {
+    L.push(`\n== TODAY'S INTENTION == ${intent.mode === 'nospend' ? 'No-spend day' : intent.mode === 'essentials' ? 'Essentials only' : 'Free day'} (they committed to this at morning check-in — hold them to it).`);
+  }
+  L.push(`\nToday is ${now().toDateString()}. Days left in month: ${daysLeftInMonth()}.`);
+  return L.join('\n');
+}
+
+function daysLeftInMonth() {
+  const t = now();
+  return new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate() - t.getDate() + 1;
+}
+const dayKeyOf = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/* ==================================================================== *
+ *  COACH — chat UI                                                      *
+ * ==================================================================== */
+let chatBusy = false;
+
+function renderCoach() {
+  const log = $('#chat-log'); log.innerHTML = '';
+  if (!AI.ready()) {
+    $('#chat-bar').classList.add('hidden');
+    log.innerHTML = `
+      <div class="chat-hello"><span class="big">✦</span><b>Meet your coach.</b><br>
+      Ask anything about your money and get straight answers using your real numbers.
+      It runs on your own Google AI key — free tier is plenty.</div>
+      <div class="ai-setup">
+        <h3>Connect Google AI</h3>
+        <p>Paste your Google AI Studio API key (aistudio.google.com → Get API key). It's stored <b>only on this phone</b> — never synced, never sent anywhere except Google.</p>
+        <div class="field"><label>API key</label><input id="ai-key" type="password" placeholder="AIza…" autocomplete="off" /></div>
+        <button class="btn-primary" id="ai-save">Connect</button>
+      </div>`;
+    $('#ai-save').onclick = () => {
+      const k = $('#ai-key').value.trim();
+      if (k.length < 20) { toast('That doesn\'t look like a key.'); return; }
+      db.settings.aiKey = k; save(true);
+      toast('Connected. Ask away.');
+      renderCoach();
+    };
+    return;
+  }
+  $('#chat-bar').classList.remove('hidden');
+  const msgs = (db.coach && db.coach.messages) || [];
+  if (!msgs.length) {
+    log.innerHTML = `
+      <div class="chat-hello"><span class="big">✦</span><b>Your money. Ask it anything.</b><br>I can see everything you've logged — and I don't sugarcoat.</div>
+      <div class="chat-sugs">
+        <button class="chip" data-sug>How am I doing this month?</button>
+        <button class="chip" data-sug>Where am I leaking money?</button>
+        <button class="chip" data-sug>Make me a plan to clear my debts</button>
+        <button class="chip" data-sug>Can I afford £25 tonight?</button>
+      </div>`;
+    log.querySelectorAll('[data-sug]').forEach(b => b.onclick = () => { $('#chat-in').value = b.textContent; sendChat(); });
+  } else {
+    for (const m of msgs) log.appendChild(el('div', 'msg ' + (m.role === 'user' ? 'user' : 'ai') + (m.err ? ' err' : ''), esc(m.text)));
+    if (chatBusy) log.appendChild(el('div', 'msg ai typing', '<i></i><i></i><i></i>'));
+    else log.appendChild(clearChatLink());
+  }
+  scrollChat();
+}
+function clearChatLink() {
+  const d = el('div', 'settings-link');
+  const b = el('button', null, 'Clear conversation');
+  b.onclick = () => { if (confirm('Clear the coach conversation?')) { db.coach.messages = []; save(); renderCoach(); } };
+  d.appendChild(b); return d;
+}
+function scrollChat() {
+  if (currentScreen !== 'coach') return;
+  requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const inp = $('#chat-in');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  db.coach = db.coach || { messages: [] };
+  db.coach.messages.push({ role: 'user', text });
+  save();
+  renderCoach();
+
+  const log = $('#chat-log');
+  const typing = el('div', 'msg ai typing', '<i></i><i></i><i></i>');
+  log.appendChild(typing); scrollChat();
+  chatBusy = true; $('#chat-send').disabled = true;
+
+  try {
+    const history = db.coach.messages.filter(m => !m.err).slice(-12).map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
+    const reply = await AI.generate(history, buildCoachContext(), false);
+    db.coach.messages.push({ role: 'ai', text: reply.trim() });
+    if (db.coach.messages.length > 40) db.coach.messages = db.coach.messages.slice(-40);
+    save();
+  } catch (e) {
+    const msg = e.message === 'bad-key' ? 'Your API key was rejected. Check it in Settings → AI coach.'
+      : e.message === 'rate-limit' ? 'Google says slow down (rate limit). Try again in a minute.'
+      : e.message === 'blocked' ? 'Google\'s safety filter blocked that reply. Rephrase and try again.'
+      : (e.message === 'server' || e.message === 'empty') ? 'The AI service had a problem answering. Try again in a moment.'
+      : 'Couldn\'t reach the AI. Check your connection and try again.';
+    db.coach.messages.push({ role: 'ai', text: msg, err: true });
+    save(true);
+  } finally {
+    chatBusy = false; $('#chat-send').disabled = false;
+    if (currentScreen === 'coach') renderCoach();   // reply is saved; other screens re-render on nav
+  }
+}
+
+/* ==================================================================== *
+ *  TYPE-TO-LOG — parse "45 dh taxi" locally, AI fallback for the rest.  *
+ * ==================================================================== */
+const QUICK_KW = [
+  [/taxi|uber|bus|train|tram|petrol|fuel|gas station|metro/, 'trans'],
+  [/coffee|cafe|café|snack|croissant|tea\b/, 'coffee'],
+  [/lunch|dinner|breakfast|restaurant|takeaway|take-away|delivery|pizza|burger|kebab|tacos|mcdo|kfc/, 'eat'],
+  [/grocer|supermarket|market|carrefour|marjane|aswak|lidl|aldi|tesco|food shop/, 'food'],
+  [/netflix|spotify|youtube|subscription|sub\b|icloud|prime/, 'subs'],
+  [/rent|electric|water bill|gaz|wifi bill|bill\b|bills\b/, 'bills'],
+  [/pharmacy|medicine|doctor|dentist|gym/, 'health'],
+  [/clothes|shoes|sneakers|hoodie|game|console|amazon|shein|zara/, 'fun'],
+  [/cinema|club|drinks|bar\b|shisha|night out|concert/, 'going'],
+  [/recharge|phone credit|sim|internet|data\b/, 'phone'],
+  [/gift|present|family|mum|mom|dad/, 'gifts'],
+];
+function parseQuick(raw) {
+  const t = raw.toLowerCase().trim();
+  // "1,500" is a thousands separator; "3,50" is a European decimal
+  const m = t.match(/\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:[.,]\d{1,2})?/);
+  if (!m) return null;
+  const amount = parseFloat(/^\d{1,3}(?:,\d{3})+/.test(m[0]) ? m[0].replace(/,/g, '') : m[0].replace(',', '.'));
+  if (!amount || amount <= 0) return null;
+  let cur = db.settings.mainCurrency;
+  if (/(dh\b|dhs\b|mad\b|dirhams?\b|درهم|د\.م)/.test(t)) cur = 'MAD';
+  else if (/(£|gbp\b|pound|quid)/.test(t)) cur = 'GBP';
+  const income = /(salary|income|got paid|paid me|received|freelance|payday)/.test(t);
+  let cat = 'other';
+  if (!income) for (const [re, id] of QUICK_KW) { if (re.test(t) && db.categories.some(c => c.id === id)) { cat = id; break; } }
+  const note = raw.replace(m[0], '').replace(/(dirhams?|dhs?|mad|gbp|£|د\.م|درهم)/ig, '').replace(/\s+/g, ' ').trim();
+  return { kind: income ? 'income' : 'expense', amount, cur, cat, note };
+}
+async function parseQuickAI(raw) {
+  const catIds = db.categories.map(c => `"${c.id}" (${c.name})`).join(', ');
+  const sys = `Parse a money note into strict JSON: {"kind":"expense"|"income","amount":number,"currency":"GBP"|"MAD","category":string,"note":string}. Category must be one of: ${catIds}. "dh"/"dirham" means MAD; default currency GBP. note = short human description. Reply with JSON only.`;
+  const text = await AI.generate([{ role: 'user', parts: [{ text: raw }] }], sys, true);
+  const p = JSON.parse(text);
+  if (!p || typeof p.amount !== 'number' || p.amount <= 0) throw new Error('bad-parse');
+  return {
+    kind: p.kind === 'income' ? 'income' : 'expense',
+    amount: p.amount,
+    cur: p.currency === 'MAD' ? 'MAD' : 'GBP',
+    cat: db.categories.some(c => c.id === p.category) ? p.category : 'other',
+    note: String(p.note || '').slice(0, 60),
+  };
+}
+async function applyQuick(raw, srcInput) {
+  let p = parseQuick(raw);
+  if ((!p || p.cat === 'other') && AI.ready()) {
+    try { p = await parseQuickAI(raw) || p; } catch (e) { /* fall back to local result */ }
+  }
+  // The AI call can take seconds — if the user closed the sheet, confirmed the
+  // add, or moved into pause-and-think meanwhile, don't hijack their state.
+  // (closeSheet only hides #sheet, so check visibility as well as attachment.)
+  if (srcInput && (!srcInput.isConnected || $('#sheet').classList.contains('hidden'))) return;
+  if (!p) { toast('Couldn\'t read that — need at least an amount.'); return; }
+  draft.kind = p.kind; draft.amount = String(p.amount); draft.cur = p.cur;
+  draft.cat = p.cat; draft.note = p.note;
+  renderAddSheet();
+  toast(`Read it: ${fmt(p.amount, p.cur)} ${p.kind === 'income' ? 'in' : '· ' + catById(p.cat).name}. Check & confirm.`);
+}
+
+/* ==================================================================== *
+ *  CHECK-INS — the app starts the conversation.                         *
+ * ==================================================================== */
+function weekKeyOf(d) {
+  const y = new Date(d.getFullYear(), 0, 1);
+  return `${d.getFullYear()}-w${Math.floor((d - y) / 604800000)}`;
+}
+function pendingCheckin() {
+  const t = now(), h = t.getHours();
+  const ck = db.checkins || (db.checkins = {});
+  if (t.getDay() === 0 && h >= 9 && ck.lastWeekly !== weekKeyOf(t)) return 'weekly';
+  if (h >= 5 && h < 12 && ck.lastMorning !== dayKeyOf(t)) return 'morning';
+  if (h >= 18 && ck.lastEvening !== dayKeyOf(t)) return 'evening';
+  return null;
+}
+function renderCheckinCard() {
+  const box = $('#checkin-card'); box.innerHTML = '';
+  const p = pendingCheckin();
+  if (!p) return;
+  const copy = {
+    morning: ['☀️', '<b>Morning check-in.</b> Set the tone before the day spends you.'],
+    evening: ['🌙', '<b>Evening check-in.</b> Anything you forgot to log? Did you keep your word?'],
+    weekly:  ['🧾', '<b>Sunday reckoning.</b> Sit down. We\'re going through your week.'],
+  }[p];
+  const card = el('div', 'checkin-card', `<span class="ci">${copy[0]}</span><span>${copy[1]}</span><span class="go">›</span>`);
+  card.addEventListener('click', () => openCheckin(p));
+  box.appendChild(card);
+}
+function todayExpenses() {
+  const k = dayKeyOf(now());
+  return db.tx.filter(t => t.kind === 'expense' && dayKeyOf(new Date(t.date)) === k);
+}
+function openCheckin(type) {
+  const ck = db.checkins;
+  if (type === 'morning') {
+    const cash = liquidGBP();
+    const daily = Math.max(0, (cash - oweGBP()) / Math.max(1, daysLeftInMonth()));
+    const body = openSheet(`
+      <h2>☀️ Morning.</h2>
+      <p class="sub">Cash: <b>${fmtGBP(cash)}</b> · after debts that's roughly <b>${fmtGBP(daily)}</b>/day for the rest of the month.</p>
+      <div class="field"><label>What kind of day is today?</label>
+        <div class="intent-row">
+          <button data-i="nospend"><span class="em">🚫</span>No-spend</button>
+          <button data-i="essentials"><span class="em">🥖</span>Essentials only</button>
+          <button data-i="free"><span class="em">🌊</span>Free day</button>
+        </div>
+      </div>
+      <p class="sub" style="text-align:center">Pick one. Tonight I'll check if you kept it.</p>
+      <button class="btn-ghost" data-close>Skip today</button>
+    `);
+    body.querySelectorAll('[data-i]').forEach(b => b.onclick = () => {
+      ck.intention = { day: dayKeyOf(now()), mode: b.dataset.i };
+      ck.lastMorning = dayKeyOf(now()); save(); closeSheet();
+      toast(b.dataset.i === 'nospend' ? 'No-spend day. I\'m watching.' : b.dataset.i === 'essentials' ? 'Essentials only. Hold the line.' : 'Free day — still log everything.');
+      renderCheckinCard();
+    });
+    body.querySelector('[data-close]').addEventListener('click', () => { ck.lastMorning = dayKeyOf(now()); save(true); renderCheckinCard(); });
+  } else if (type === 'evening') {
+    const todays = todayExpenses();
+    const total = todays.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+    const intent = ck.intention && ck.intention.day === dayKeyOf(now()) ? ck.intention.mode : null;
+    let verdict = '';
+    if (intent === 'nospend') verdict = todays.length === 0
+      ? `<div class="ck-stat good">🚫 You said no-spend — and you spent <b>nothing</b>. That's how it's done.</div>`
+      : `<div class="ck-stat bad">🚫 You promised a no-spend day, then spent <b>${fmtGBP(total)}</b>. You broke your own word.</div>`;
+    else if (intent === 'essentials') {
+      const bad = todays.filter(t => !catById(t.cat).essential);
+      verdict = bad.length === 0
+        ? `<div class="ck-stat good">🥖 Essentials only — kept. ${todays.length ? `You spent ${fmtGBP(total)}, all necessary.` : 'Nothing spent at all.'}</div>`
+        : `<div class="ck-stat bad">🥖 "Essentials only" — but ${fmtGBP(bad.reduce((s, t) => s + toGBP(t.amount, t.cur), 0))} of today's spend wasn't essential. Own it below.</div>`;
+    }
+    const body = openSheet(`
+      <h2>🌙 Evening reckoning.</h2>
+      <p class="sub">Today: <b>${todays.length}</b> expense${todays.length === 1 ? '' : 's'}, <b>${fmtGBP(total)}</b> total.</p>
+      ${verdict}
+      <button class="btn-primary" id="ev-add">＋ Log something I forgot</button>
+      <button class="btn-ghost" data-close id="ev-done">All logged — good night</button>
+    `);
+    // only an explicit choice consumes the check-in — a stray backdrop tap doesn't
+    const evDone = () => { ck.lastEvening = dayKeyOf(now()); save(); renderCheckinCard(); };
+    $('#ev-add').onclick = () => { evDone(); closeSheet(); openAdd(); };
+    $('#ev-done').addEventListener('click', evDone);
+  } else {
+    const weekAgo = new Date(now() - 7 * 86400000);
+    const wk = db.tx.filter(t => t.kind === 'expense' && new Date(t.date) >= weekAgo);
+    const spent = wk.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+    const wasted = wk.filter(t => t.regret === 'stupid').reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+    const prevStart = new Date(now() - 14 * 86400000);
+    const prev = db.tx.filter(t => t.kind === 'expense' && new Date(t.date) >= prevStart && new Date(t.date) < weekAgo)
+      .reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+    const unjudged = wk.filter(t => t.regret == null && !catById(t.cat).essential).length;
+    const cmp = prev > 0 ? (spent > prev * 1.05 ? `<div class="ck-stat bad">📈 Up <b>${Math.round((spent - prev) / prev * 100)}%</b> on last week (${fmtGBP(prev)}). Wrong direction.</div>`
+      : spent < prev * 0.95 ? `<div class="ck-stat good">📉 Down <b>${Math.round((prev - spent) / prev * 100)}%</b> on last week. Keep going.</div>`
+      : `<div class="ck-stat">➖ Flat vs last week.</div>`) : '';
+    const body = openSheet(`
+      <h2>🧾 Sunday reckoning.</h2>
+      <p class="sub">The week, in cold numbers:</p>
+      <div class="ck-stat">Spent <b>${fmtGBP(spent)}</b> · wasted <b>${fmtGBP(wasted)}</b>${spent > 0 ? ` (${Math.round(wasted / spent * 100) || 0}%)` : ''}</div>
+      ${cmp}
+      ${unjudged ? `<div class="ck-stat bad">⚖️ <b>${unjudged}</b> purchase${unjudged > 1 ? 's' : ''} still unjudged. Face them.</div>` : `<div class="ck-stat good">⚖️ Everything judged. Respect.</div>`}
+      <button class="btn-primary" id="wk-review">Go through the week →</button>
+      <button class="btn-ghost" data-close id="wk-done">Done</button>
+    `);
+    const wkDone = () => { ck.lastWeekly = weekKeyOf(now()); save(); renderCheckinCard(); };
+    $('#wk-review').onclick = () => { wkDone(); closeSheet(); go('review'); };
+    $('#wk-done').addEventListener('click', wkDone);
+  }
+}
+
+/* ==================================================================== *
  *  WIRING                                                               *
  * ==================================================================== */
 function bindOnce() {
@@ -1274,6 +1692,9 @@ function bindOnce() {
   $('#fab').onclick = openAdd;
   // rate chip
   $('#rate-chip').onclick = openRate;
+  // coach chat
+  $('#chat-send').onclick = sendChat;
+  $('#chat-in').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
   // sheet close
   $('#sheet').addEventListener('click', e => { if (e.target.matches('[data-close], .sheet-backdrop')) closeSheet(); });
   // add buttons per screen
@@ -1302,6 +1723,10 @@ async function bootApp() {
   renderRateChip();
   go('home');
   refreshRate(false);
+
+  // The app opens the conversation: surface today's check-in once per slot.
+  const pending = pendingCheckin();
+  if (pending) setTimeout(() => { if (!$('#sheet').classList.contains('hidden')) return; openCheckin(pending); }, 600);
 }
 
 /* start */

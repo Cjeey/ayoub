@@ -48,6 +48,7 @@
     <div id="screens">
       <!-- Home -->
       <section class="screen" data-screen="home">
+        <div id="checkin-card"></div>
         <div id="alerts" class="alerts"></div>
         <div class="net-card">
           <div class="net-label">NET WORTH · in £</div>
@@ -102,6 +103,15 @@
         <div id="owed-list" class="loan-list"></div>
       </section>
 
+      <!-- Coach -->
+      <section class="screen hidden" data-screen="coach">
+        <div id="chat-log" class="chat-log"></div>
+        <div class="chat-inputbar" id="chat-bar">
+          <input id="chat-in" type="text" placeholder="Ask about your money…" autocomplete="off" />
+          <button id="chat-send" aria-label="Send">➤</button>
+        </div>
+      </section>
+
       <!-- Review -->
       <section class="screen hidden" data-screen="review">
         <div class="review-head" id="review-head"></div>
@@ -120,6 +130,7 @@
       <button class="nav-btn" data-nav="spend"><span class="ni">▤</span><span>Spend</span></button>
       <button class="nav-btn" data-nav="save"><span class="ni">◆</span><span>Save</span></button>
       <button class="nav-btn" data-nav="loans"><span class="ni">⇄</span><span>Loans</span></button>
+      <button class="nav-btn" data-nav="coach"><span class="ni">✦</span><span>Coach</span></button>
       <button class="nav-btn" data-nav="review"><span class="ni">⚖</span><span>Review</span></button>
     </nav>
   </main>

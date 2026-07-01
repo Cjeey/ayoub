@@ -1,5 +1,5 @@
 /* Reckon service worker — offline-first shell cache. */
-const CACHE = 'reckon-v3';
+const CACHE = 'reckon-v4';
 const ASSETS = [
   './',
   './index.html',
