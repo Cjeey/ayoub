@@ -363,7 +363,38 @@ function savedGBP()  { return db.goals.reduce((s, g) => s + toGBP(g.saved, g.cur
 function oweGBP()    { return db.loans.filter(l => l.dir === 'owe'  && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
 function owedGBP()   { return db.loans.filter(l => l.dir === 'owed' && !l.settled).reduce((s, l) => s + toGBP(l.amount, l.cur), 0); }
 
+function renderAlerts() {
+  const box = $('#alerts'); box.innerHTML = '';
+  const items = [];
+
+  // Loans you owe: overdue, then due soon
+  const owe = db.loans.filter(l => l.dir === 'owe' && !l.settled && l.due);
+  for (const l of owe) {
+    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
+    if (d < 0) items.push({ cls: 'a-bad', ic: '🔴', html: `You're <b>${-d}d overdue</b> paying <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)}. Sort it.`, nav: 'loans' });
+    else if (d <= 3) items.push({ cls: 'a-warn', ic: '⏰', html: `Pay <b>${esc(l.who)}</b> ${fmt(l.amount, l.cur)} ${d === 0 ? '<b>today</b>' : `in <b>${d}d</b>`}.`, nav: 'loans' });
+  }
+
+  // Money owed to you, overdue
+  for (const l of db.loans.filter(l => l.dir === 'owed' && !l.settled && l.due)) {
+    const d = daysBetween(new Date(new Date(l.due).toDateString()), new Date(now().toDateString()));
+    if (d < 0) items.push({ cls: 'a-warn', ic: '📌', html: `<b>${esc(l.who)}</b> is <b>${-d}d late</b> paying you back ${fmt(l.amount, l.cur)}. Chase it.`, nav: 'loans' });
+  }
+
+  // Weekly review nudge
+  const weekAgo = new Date(now() - 7 * 86400000);
+  const pending = db.tx.filter(t => t.kind === 'expense' && t.regret == null && !catById(t.cat).essential && new Date(t.date) >= weekAgo);
+  if (pending.length) items.push({ cls: 'a-warn', ic: '⚖️', html: `<b>${pending.length}</b> purchase${pending.length > 1 ? 's' : ''} from this week need${pending.length > 1 ? '' : 's'} an honest verdict.`, nav: 'review' });
+
+  for (const it of items.slice(0, 4)) {
+    const a = el('div', 'alert ' + it.cls, `<span class="ai">${it.ic}</span><span>${it.html}</span><span class="go">›</span>`);
+    a.addEventListener('click', () => go(it.nav));
+    box.appendChild(a);
+  }
+}
+
 function renderHome() {
+  renderAlerts();
   const net = liquidGBP() + savedGBP() + owedGBP() - oweGBP();
   const nv = $('#net-value');
   nv.textContent = fmtGBP(net);
@@ -695,12 +726,69 @@ function renderReview() {
        </div>`;
   }
 
+  renderInsights();
+
   const box = $('#review-list'); box.innerHTML = '';
   // unjudged non-essentials first, then the rest
   const ordered = [...unflagged, ...recent.filter(t => !unflagged.includes(t))];
   if (!ordered.length) { box.appendChild(el('div', 'empty', 'Nothing to review.')); return; }
   for (const t of ordered) box.appendChild(reviewRow(t));
 }
+/* Data-driven, blunt insights on your patterns. */
+function renderInsights() {
+  const box = $('#insights'); box.innerHTML = '';
+  const out = [];
+  const exp = db.tx.filter(t => t.kind === 'expense');
+  const thisM = exp.filter(t => isThisMonth(t.date));
+
+  // 1) This month vs last month total
+  const lastMkDate = new Date(now().getFullYear(), now().getMonth() - 1, 1);
+  const lastMk = monthKey(lastMkDate);
+  const lastM = exp.filter(t => monthKey(new Date(t.date)) === lastMk);
+  const sumT = thisM.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  const sumL = lastM.reduce((s, t) => s + toGBP(t.amount, t.cur), 0);
+  if (sumL > 0 && thisM.length) {
+    const pct = Math.round((sumT - sumL) / sumL * 100);
+    if (pct > 5) out.push({ ic: '📈', html: `You're spending <span class="up">${pct}% more</span> than this time last month (${fmtGBP(sumT)} vs ${fmtGBP(sumL)}). Watch it.` });
+    else if (pct < -5) out.push({ ic: '📉', html: `You're spending <span class="down">${Math.abs(pct)}% less</span> than last month. Keep that going.` });
+    else out.push({ ic: '➖', html: `Spending's flat vs last month (${fmtGBP(sumT)}). Steady, but flat isn't saving.` });
+  }
+
+  // 2) Biggest leak — category with the most 'stupid' this month, else most non-essential
+  const wasteBy = {}, neBy = {};
+  for (const t of thisM) {
+    const g = toGBP(t.amount, t.cur);
+    if (t.regret === 'stupid') wasteBy[t.cat] = (wasteBy[t.cat] || 0) + g;
+    if (!catById(t.cat).essential) neBy[t.cat] = (neBy[t.cat] || 0) + g;
+  }
+  const leak = Object.entries(wasteBy).sort((a, b) => b[1] - a[1])[0] || Object.entries(neBy).sort((a, b) => b[1] - a[1])[0];
+  if (leak && leak[1] > 0) {
+    const isWaste = !!wasteBy[leak[0]];
+    out.push({ ic: '🩸', html: `Your biggest ${isWaste ? 'money leak' : 'non-essential'} this month is <b>${esc(catById(leak[0]).name)}</b> at <b>${fmtGBP(leak[1])}</b>.` });
+  }
+
+  // 3) Worst weekday for stupid spending (all time)
+  const dow = [0, 0, 0, 0, 0, 0, 0];
+  const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  let anyWaste = false;
+  for (const t of exp) if (t.regret === 'stupid') { dow[new Date(t.date).getDay()] += toGBP(t.amount, t.cur); anyWaste = true; }
+  if (anyWaste) {
+    let mi = 0; for (let i = 1; i < 7; i++) if (dow[i] > dow[mi]) mi = i;
+    if (dow[mi] > 0) out.push({ ic: '📅', html: `<b>${names[mi]}s</b> are your weak spot — most of your wasted money goes out then.` });
+  }
+
+  // 4) Average stupid purchase
+  const stupids = exp.filter(t => t.regret === 'stupid');
+  if (stupids.length >= 2) {
+    const avg = stupids.reduce((s, t) => s + toGBP(t.amount, t.cur), 0) / stupids.length;
+    out.push({ ic: '🧮', html: `Your average regret buy is <b>${fmtGBP(avg)}</b>, and you've made <b>${stupids.length}</b> of them. It adds up.` });
+  }
+
+  if (!out.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  for (const o of out) box.appendChild(el('div', 'insight', `<span class="ii">${o.ic}</span><span>${o.html}</span>`));
+}
+
 function reviewRow(t) {
   const c = catById(t.cat);
   const row = el('div', 'tx');

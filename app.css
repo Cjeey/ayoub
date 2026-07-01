@@ -88,6 +88,31 @@ input, select { font-family: inherit; }
 .screen { padding: 4px 16px 20px; animation: fade .25s ease; }
 @keyframes fade { from { opacity: 0; transform: translateY(6px);} to { opacity:1; transform:none; } }
 
+/* ===================== Alerts (reminders) ===================== */
+.alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.alerts:empty { display: none; }
+.alert {
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  border-radius: 12px; font-size: 13.5px; border: 1px solid var(--line);
+  background: var(--card); line-height: 1.35;
+}
+.alert .ai { font-size: 18px; flex: none; }
+.alert.a-bad { background: var(--bad-soft); border-color: #5a2b34; }
+.alert.a-warn { background: var(--warn-soft); border-color: #5a4522; }
+.alert b { font-weight: 700; }
+.alert .go { margin-left: auto; color: var(--muted); font-size: 20px; flex: none; }
+
+/* ===================== Insights ===================== */
+.insights { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 4px; }
+.insight {
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 13px 15px; font-size: 13.5px; line-height: 1.4; display: flex; gap: 11px; align-items: flex-start;
+}
+.insight .ii { font-size: 19px; flex: none; margin-top: 1px; }
+.insight b { font-weight: 700; }
+.insight .up { color: var(--bad); font-weight: 700; }
+.insight .down { color: var(--good); font-weight: 700; }
+
 /* ===================== Net card ===================== */
 .net-card {
   background: linear-gradient(150deg, #202a45, #171b28);
